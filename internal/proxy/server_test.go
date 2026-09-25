@@ -1033,6 +1033,7 @@ func TestChatCompletionsUsesVirtualModelRouteOrderAndAlias(t *testing.T) {
 		ModelRoutes: map[string]config.ModelRoute{
 			"glm-5.3-flash": {Providers: []string{"second", "first"}},
 		},
+		ModelRouteOrder: []string{"glm-5.3-flash"},
 	})
 	if err != nil {
 		t.Fatalf("create proxy: %v", err)
@@ -1063,6 +1064,96 @@ func TestChatCompletionsUsesVirtualModelRouteOrderAndAlias(t *testing.T) {
 	defer unknown.Body.Close()
 	if unknown.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
+	}
+}
+
+func TestModelsListsConfiguredRoutesInDeclarationOrder(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: "https://provider.example/v1", APIKey: "secret", ModelAliases: map[string]string{
+				"gonka": "deepseek-v4-flash-0731", "glm-5.3-flash": "glm-5.3-flash",
+			}, Priority: 10},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":         {Providers: []string{"primary"}},
+			"glm-5.3-flash": {Providers: []string{"primary"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash", "gonka"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200", response.StatusCode)
+	}
+	var body struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if body.Object != "list" || len(body.Data) != 2 {
+		t.Fatalf("models response = %#v", body)
+	}
+	if body.Data[0].ID != "glm-5.3-flash" || body.Data[1].ID != "gonka" {
+		t.Fatalf("model order = %q, %q", body.Data[0].ID, body.Data[1].ID)
+	}
+	for _, model := range body.Data {
+		if model.Object != "model" || model.Created != 0 || model.OwnedBy != "gonka-proxy" {
+			t.Errorf("model metadata = %#v", model)
+		}
+	}
+}
+
+func TestModelsListsLegacyGonkaRouteWithoutProviderDetails(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "secret-provider", BaseURL: "https://private.example/v1", APIKey: "private-key", ModelAlias: "private-upstream-model", Priority: 10,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read models response: %v", err)
+	}
+	if !strings.Contains(string(body), `"id":"gonka"`) || strings.Contains(string(body), "private") {
+		t.Fatalf("models response exposes unexpected details: %s", body)
 	}
 }
 

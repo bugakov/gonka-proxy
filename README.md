@@ -84,6 +84,14 @@ model_routes:
 
 The request's `model` selects a Model Route. A missing `model` selects `gonka`; an unknown model returns `404` when `model_routes` is configured. A legacy configuration containing only scalar `model_alias` values continues to route through `gonka` and retains the previous behavior.
 
+Agents can discover the configured Virtual Models through the OpenAI-compatible endpoint:
+
+```sh
+curl http://127.0.0.1:58081/v1/models
+```
+
+It returns route IDs in configuration order with stable `model` metadata. Provider URLs, credentials, upstream aliases, and temporary Provider health are not exposed.
+
 ## Metrics
 
 The proxy exposes Prometheus-compatible metrics at `GET /metrics` on the same address as the chat endpoint. Keep the listener on loopback when metrics must remain local:

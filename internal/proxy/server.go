@@ -19,6 +19,7 @@ import (
 )
 
 const chatCompletionsPath = "/v1/chat/completions"
+const modelsPath = "/v1/models"
 
 const (
 	maxLoggedErrorMessageLength = 512
@@ -42,6 +43,7 @@ type Logger interface {
 type Server struct {
 	providers        []*provider
 	routes           map[string][]*provider
+	modelOrder       []string
 	legacyModelMode  bool
 	client           *http.Client
 	metrics          *metricsCollector
@@ -116,6 +118,13 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	if len(modelRoutes) == 0 {
 		modelRoutes = map[string]config.ModelRoute{"gonka": {}}
 	}
+	modelOrder := append([]string(nil), cfg.ModelRouteOrder...)
+	if len(modelOrder) == 0 {
+		for routeName := range modelRoutes {
+			modelOrder = append(modelOrder, routeName)
+		}
+		sort.Strings(modelOrder)
+	}
 	for routeName, modelRoute := range modelRoutes {
 		routeProviders := make([]*provider, 0, len(providers))
 		if len(modelRoute.Providers) == 0 {
@@ -141,6 +150,7 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	server := &Server{
 		providers:        providers,
 		routes:           routes,
+		modelOrder:       modelOrder,
 		legacyModelMode:  len(cfg.ModelRoutes) == 0,
 		cooldownDuration: cfg.Cooldown,
 		recoveryWait:     cfg.RecoveryWait,
@@ -182,6 +192,18 @@ func resolveReasoningEffort(global *config.ReasoningEffort, p config.Provider) *
 
 // ServeHTTP handles the chat completion and operational metrics endpoints.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == modelsPath {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := s.serveModels(w); err != nil {
+			s.logAt(config.LogLevelError, "models response error - %v", err)
+		}
+		return
+	}
 	if r.URL.Path == "/metrics" {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -245,6 +267,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.route(w, r, payload)
+}
+
+type modelListResponse struct {
+	Object string       `json:"object"`
+	Data   []modelEntry `json:"data"`
+}
+
+type modelEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
+func (s *Server) serveModels(w http.ResponseWriter) error {
+	response := modelListResponse{
+		Object: "list",
+		Data:   make([]modelEntry, 0, len(s.modelOrder)),
+	}
+	for _, model := range s.modelOrder {
+		if _, exists := s.routes[model]; !exists {
+			continue
+		}
+		response.Data = append(response.Data, modelEntry{
+			ID:      model,
+			Object:  "model",
+			Created: 0,
+			OwnedBy: "gonka-proxy",
+		})
+	}
+	return json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {

@@ -111,6 +111,7 @@ type Config struct {
 	ReasoningEffort       *ReasoningEffort
 	Providers             []Provider
 	ModelRoutes           map[string]ModelRoute
+	ModelRouteOrder       []string
 }
 
 // ModelRoute maps a Virtual Model to an optional ordered list of Provider
@@ -183,6 +184,7 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &rawMap); err != nil {
 		return Config{}, fmt.Errorf("decode config %q: %w", path, err)
 	}
+	modelRouteOrder := parseModelRouteOrder(data)
 	node, ok := rawMap["reasoning_effort"]
 	if !ok {
 		return Config{}, fmt.Errorf("reasoning_effort is required")
@@ -226,6 +228,7 @@ func Load(path string) (Config, error) {
 		ReasoningEffort:       parsedReasoningEffort,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
 		ModelRoutes:           make(map[string]ModelRoute, len(raw.ModelRoutes)),
+		ModelRouteOrder:       modelRouteOrder,
 	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = DefaultListenAddress
@@ -265,6 +268,35 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func parseModelRouteOrder(data []byte) []string {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil || len(document.Content) == 0 {
+		return nil
+	}
+	root := document.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		if root.Content[index].Value != "model_routes" {
+			continue
+		}
+		routes := root.Content[index+1]
+		if routes.Kind != yaml.MappingNode {
+			return nil
+		}
+		order := make([]string, 0, len(routes.Content)/2)
+		for routeIndex := 0; routeIndex+1 < len(routes.Content); routeIndex += 2 {
+			name := strings.TrimSpace(routes.Content[routeIndex].Value)
+			if name != "" {
+				order = append(order, name)
+			}
+		}
+		return order
+	}
+	return nil
 }
 
 // Validate ensures a Config can be used to start the proxy.
@@ -360,6 +392,9 @@ type providerIdentity struct {
 
 func (c Config) validateModelRoutes() error {
 	if len(c.ModelRoutes) == 0 {
+		if len(c.ModelRouteOrder) > 0 {
+			return fmt.Errorf("model_route_order must be empty when model_routes is empty")
+		}
 		for _, provider := range c.Providers {
 			if strings.TrimSpace(provider.ModelAlias) != "" {
 				return nil
@@ -371,6 +406,23 @@ func (c Config) validateModelRoutes() error {
 	providersByName := make(map[string]Provider, len(c.Providers))
 	for _, provider := range c.Providers {
 		providersByName[strings.TrimSpace(provider.Name)] = provider
+	}
+	if len(c.ModelRouteOrder) != len(c.ModelRoutes) {
+		return fmt.Errorf("model_route_order must list every model route exactly once")
+	}
+	orderedRoutes := make(map[string]struct{}, len(c.ModelRouteOrder))
+	for index, rawRouteName := range c.ModelRouteOrder {
+		routeName := strings.TrimSpace(rawRouteName)
+		if routeName == "" {
+			return fmt.Errorf("model_route_order[%d] must not be empty", index)
+		}
+		if _, exists := c.ModelRoutes[routeName]; !exists {
+			return fmt.Errorf("model_route_order[%d] references unknown model route %q", index, routeName)
+		}
+		if _, exists := orderedRoutes[routeName]; exists {
+			return fmt.Errorf("model_route_order contains duplicate model route %q", routeName)
+		}
+		orderedRoutes[routeName] = struct{}{}
 	}
 	for rawRouteName, route := range c.ModelRoutes {
 		routeName := strings.TrimSpace(rawRouteName)

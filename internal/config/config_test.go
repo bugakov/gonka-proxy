@@ -68,6 +68,9 @@ model_routes:
 	if len(cfg.ModelRoutes) != 2 || cfg.ModelRoutes["glm-5.3-flash"].Providers[0] != "primary" {
 		t.Fatalf("model routes = %#v", cfg.ModelRoutes)
 	}
+	if len(cfg.ModelRouteOrder) != 2 || cfg.ModelRouteOrder[0] != "gonka" || cfg.ModelRouteOrder[1] != "glm-5.3-flash" {
+		t.Fatalf("model route order = %#v", cfg.ModelRouteOrder)
+	}
 }
 
 func TestLoadRejectsInvalidModelRoutes(t *testing.T) {
