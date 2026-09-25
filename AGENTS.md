@@ -4,7 +4,7 @@
 
 ### Issue tracker
 
-Local markdown — issues and PRDs live as files under `.scratch/<feature-slug>/` in this repo. No external PRs as a triage surface. See `docs/agents/issue-tracker.md`.
+GitHub Issues for `bugakov/gonka-proxy`. No external PRs as a triage surface. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
