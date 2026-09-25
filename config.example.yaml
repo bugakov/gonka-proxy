@@ -46,6 +46,10 @@ providers:
     api_key: replace-with-provider-key
     model_alias: provider-model-name
     priority: 100
+    # Optional safe GET endpoint for /diagnostics; defaults to base_url/models.
+    # health_check_url: https://provider.example/v1/models
+    # Optional provider-specific balance endpoint. Omit when unsupported.
+    # balance_url: https://provider.example/v1/balance
   - name: backup
     base_url: https://backup.example/v1
     api_key: replace-with-provider-key

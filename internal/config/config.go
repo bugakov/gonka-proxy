@@ -115,11 +115,13 @@ type Config struct {
 // A provider-level reasoning_effort overrides the global value; an explicit
 // null strips the field for this provider. Leave both zero to inherit global.
 type Provider struct {
-	Name       string
-	BaseURL    string
-	APIKey     string
-	ModelAlias string
-	Priority   int
+	Name           string
+	BaseURL        string
+	APIKey         string
+	ModelAlias     string
+	Priority       int
+	HealthCheckURL string
+	BalanceURL     string
 
 	ReasoningEffort      *ReasoningEffort
 	StripReasoningEffort bool
@@ -141,11 +143,13 @@ type rawServer struct {
 }
 
 type rawProvider struct {
-	Name       string `yaml:"name"`
-	BaseURL    string `yaml:"base_url"`
-	APIKey     string `yaml:"api_key"`
-	ModelAlias string `yaml:"model_alias"`
-	Priority   *int   `yaml:"priority"`
+	Name           string `yaml:"name"`
+	BaseURL        string `yaml:"base_url"`
+	APIKey         string `yaml:"api_key"`
+	ModelAlias     string `yaml:"model_alias"`
+	Priority       *int   `yaml:"priority"`
+	HealthCheckURL string `yaml:"health_check_url"`
+	BalanceURL     string `yaml:"balance_url"`
 	// ReasoningEffort keeps the raw node to distinguish absent (inherit
 	// global, zero Node) from explicit null (strip for this provider).
 	ReasoningEffort yaml.Node `yaml:"reasoning_effort"`
@@ -290,11 +294,19 @@ func (c Config) Validate() error {
 		if _, err := parseProviderBaseURL(index, provider.BaseURL); err != nil {
 			return err
 		}
+		if _, err := parseOptionalProviderURL(index, "health_check_url", provider.HealthCheckURL); err != nil {
+			return err
+		}
+		if _, err := parseOptionalProviderURL(index, "balance_url", provider.BalanceURL); err != nil {
+			return err
+		}
 		definitionKey := providerIdentity{
 			baseURL:    provider.BaseURL,
 			apiKey:     provider.APIKey,
 			modelAlias: provider.ModelAlias,
 			priority:   provider.Priority,
+			healthURL:  provider.HealthCheckURL,
+			balanceURL: provider.BalanceURL,
 		}
 		if _, exists := seen[definitionKey]; exists {
 			return fmt.Errorf("providers[%d] duplicates another Provider definition", index)
@@ -309,6 +321,8 @@ type providerIdentity struct {
 	apiKey     string
 	modelAlias string
 	priority   int
+	healthURL  string
+	balanceURL string
 }
 
 func parseDuration(field, value string, defaultValue time.Duration) (time.Duration, error) {
@@ -353,6 +367,14 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	parsed.RawPath = ""
 	normalizedURL := strings.TrimRight(parsed.String(), "/")
+	healthCheckURL, err := parseOptionalProviderURL(index, "health_check_url", raw.HealthCheckURL)
+	if err != nil {
+		return Provider{}, err
+	}
+	balanceURL, err := parseOptionalProviderURL(index, "balance_url", raw.BalanceURL)
+	if err != nil {
+		return Provider{}, err
+	}
 
 	var effortOverride *ReasoningEffort
 	var stripEffort bool
@@ -372,16 +394,38 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	}
 
 	provider := Provider{
-		Name:       strings.TrimSpace(raw.Name),
-		BaseURL:    normalizedURL,
-		APIKey:     strings.TrimSpace(raw.APIKey),
-		ModelAlias: strings.TrimSpace(raw.ModelAlias),
-		Priority:   *raw.Priority,
+		Name:           strings.TrimSpace(raw.Name),
+		BaseURL:        normalizedURL,
+		APIKey:         strings.TrimSpace(raw.APIKey),
+		ModelAlias:     strings.TrimSpace(raw.ModelAlias),
+		Priority:       *raw.Priority,
+		HealthCheckURL: healthCheckURL,
+		BalanceURL:     balanceURL,
 
 		ReasoningEffort:      effortOverride,
 		StripReasoningEffort: stripEffort,
 	}
 	return provider, nil
+}
+
+func parseOptionalProviderURL(index int, field, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("providers[%d].%s must be an absolute HTTP(S) URL", index, field)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("providers[%d].%s must use http or https", index, field)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("providers[%d].%s must not contain credentials, query parameters, or fragments", index, field)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = ""
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func parseProviderBaseURL(index int, value string) (*url.URL, error) {

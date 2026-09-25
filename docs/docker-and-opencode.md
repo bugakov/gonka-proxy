@@ -62,6 +62,8 @@ The metrics report per-Provider successes and errors, upstream status/category, 
 
 For a human-readable provider summary, query `GET /health`. It reports current status, last success/error, cooldown transitions, counts, and latency averages. Health history is persisted at `health_history_path` with a 30-day/1,000-event retention limit. Persistence is best-effort: a broken path is logged but does not interrupt proxy routing.
 
+For active diagnostics, query `GET /diagnostics`. The proxy sends only authenticated `GET` checks to each provider (default `<base_url>/models`), never chat prompts or tools. Configure an optional provider `balance_url` for upstreams that expose a balance API; omitted capability is reported as `unavailable/unsupported`.
+
 ## Container smoke test
 
 The smoke test builds the production image and a fake HTTPS OpenAI-compatible Provider, publishes the proxy on the host loopback interface, then sends a real request through that published endpoint:

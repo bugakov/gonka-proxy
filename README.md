@@ -76,6 +76,14 @@ curl http://127.0.0.1:58081/health
 
 The summary includes each provider's healthy/degraded/unavailable status, last success and error, cooldown transitions, request/error counts, and latency averages. The state is stored in `health_history_path`; writes use an atomic replacement and are best-effort, so an unavailable or read-only path does not stop routing. Events older than 30 days and entries beyond the latest 1,000 are removed.
 
+For active provider diagnostics, use `GET /diagnostics`:
+
+```sh
+curl http://127.0.0.1:58081/diagnostics
+```
+
+Diagnostics perform a safe `GET` request (by default to `<base_url>/models`) and never send chat messages, prompts, tools, or request bodies. They classify invalid keys, unavailable endpoints, rate/concurrency exhaustion, insufficient balance, and transient failures, with a remediation hint. A provider-specific `balance_url` can be configured when that API exists; otherwise the balance result is reported as `unavailable/unsupported`.
+
 ## Reasoning effort
 
 `reasoning_effort` hints how much reasoning the upstream model should do. The proxy writes your configured value into every upstream request — whatever the client sends is overwritten. Allowed values: `none`, `low`, `medium`, `high`, `xhigh`, `max`, plus `null` (`~`) to strip the field entirely. The top-level key is **required**.

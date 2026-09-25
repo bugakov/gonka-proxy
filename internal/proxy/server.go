@@ -172,6 +172,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if r.URL.Path == "/diagnostics" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := s.serveDiagnostics(w, r.Context()); err != nil {
+			s.logAt(config.LogLevelError, "diagnostics response error - %v", err)
+		}
+		return
+	}
 	if r.URL.Path != chatCompletionsPath {
 		http.NotFound(w, r)
 		return

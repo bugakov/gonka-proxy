@@ -373,6 +373,173 @@ func TestHealthHistoryRetentionAndStorageFailureDoNotBlockRouting(t *testing.T) 
 	_ = response.Body.Close()
 }
 
+func TestDiagnosticsClassifyProviderFailuresWithoutSendingChatPayloads(t *testing.T) {
+	const secret = "diagnostic-secret"
+	type fixture struct {
+		name       string
+		statusCode int
+		body       string
+		delay      time.Duration
+	}
+	fixtures := []fixture{
+		{name: "invalid-auth", statusCode: http.StatusUnauthorized},
+		{name: "rate-limit", statusCode: http.StatusTooManyRequests},
+		{name: "concurrency", statusCode: http.StatusTooManyRequests, body: `{"error":"concurrency limit reached"}`},
+		{name: "no-balance", statusCode: http.StatusOK, body: `{"models":[]}`},
+		{name: "insufficient-balance", statusCode: http.StatusPaymentRequired},
+		{name: "timeout", statusCode: http.StatusOK, delay: 100 * time.Millisecond},
+	}
+	providers := make([]config.Provider, 0, len(fixtures))
+	servers := make([]*httptest.Server, 0, len(fixtures))
+	for _, fixture := range fixtures {
+		fixture := fixture
+		provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/models" {
+				t.Errorf("diagnostic request = %s %s, want GET /v1/models", r.Method, r.URL.Path)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer "+secret {
+				t.Errorf("diagnostic authorization = %q, want provider key", got)
+			}
+			if fixture.delay > 0 {
+				time.Sleep(fixture.delay)
+			}
+			if fixture.statusCode != http.StatusOK {
+				w.WriteHeader(fixture.statusCode)
+			}
+			_, _ = io.WriteString(w, fixture.body)
+		}))
+		servers = append(servers, provider)
+		providers = append(providers, config.Provider{
+			Name: fixture.name, BaseURL: provider.URL + "/v1", APIKey: secret, ModelAlias: "model", Priority: 1,
+		})
+	}
+	defer func() {
+		for _, provider := range servers {
+			provider.Close()
+		}
+	}()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress: "127.0.0.1:8080", Cooldown: time.Second, RecoveryWait: time.Second,
+		ResponseHeaderTimeout: 20 * time.Millisecond, ReasoningEffort: &reasoningMax, Providers: providers,
+	}, log.Default())
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read diagnostics: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	var report struct {
+		Providers []struct {
+			Provider    string `json:"provider"`
+			Status      string `json:"status"`
+			Category    string `json:"category"`
+			Remediation string `json:"remediation"`
+			Balance     struct {
+				Status   string `json:"status"`
+				Category string `json:"category"`
+			} `json:"balance"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(body, &report); err != nil {
+		t.Fatalf("decode diagnostics: %v; body=%s", err, body)
+	}
+	got := make(map[string]struct {
+		status, category, remediation, balanceStatus, balanceCategory string
+	})
+	for _, provider := range report.Providers {
+		got[provider.Provider] = struct {
+			status, category, remediation, balanceStatus, balanceCategory string
+		}{provider.Status, provider.Category, provider.Remediation, provider.Balance.Status, provider.Balance.Category}
+	}
+	wants := map[string]struct {
+		status, category, remediation, balanceStatus, balanceCategory string
+	}{
+		"invalid-auth":         {"unavailable", "invalid-auth", "rotate or replace the provider API key", "unavailable", "unsupported"},
+		"rate-limit":           {"degraded", "rate-limit", "wait, reduce concurrency, or use another provider", "unavailable", "unsupported"},
+		"concurrency":          {"degraded", "concurrency-exhausted", "wait, reduce concurrency, or use another provider", "unavailable", "unsupported"},
+		"no-balance":           {"healthy", "ok", "none", "unavailable", "unsupported"},
+		"insufficient-balance": {"unavailable", "insufficient-balance", "top up the provider balance", "unavailable", "unsupported"},
+		"timeout":              {"degraded", "transient-timeout", "check the endpoint and retry", "unavailable", "unsupported"},
+	}
+	for name, want := range wants {
+		actual, ok := got[name]
+		if !ok {
+			t.Errorf("diagnostics missing provider %q: %s", name, body)
+			continue
+		}
+		if actual.status != want.status || actual.category != want.category || actual.remediation != want.remediation || actual.balanceStatus != want.balanceStatus || actual.balanceCategory != want.balanceCategory {
+			t.Errorf("diagnostics[%q] = %#v, want %#v", name, actual, want)
+		}
+	}
+	if strings.Contains(string(body), secret) || strings.Contains(string(body), "models") {
+		t.Fatalf("diagnostics leaked credentials or upstream body: %s", body)
+	}
+}
+
+func TestDiagnosticsUsesConfiguredBalanceCapability(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/balance" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"balance":12.5}`)
+			return
+		}
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `{"models":[]}`)
+	}))
+	defer provider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress: "127.0.0.1:8080", Cooldown: time.Second, RecoveryWait: time.Second,
+		ResponseHeaderTimeout: time.Second, ReasoningEffort: &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "balance-provider", BaseURL: provider.URL + "/v1", BalanceURL: provider.URL + "/balance",
+			APIKey: "secret", ModelAlias: "model", Priority: 1,
+		}},
+	}, log.Default())
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	response, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer response.Body.Close()
+	var report struct {
+		Providers []struct {
+			Balance struct {
+				Status   string `json:"status"`
+				Category string `json:"category"`
+			} `json:"balance"`
+		} `json:"providers"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
+		t.Fatalf("decode diagnostics: %v", err)
+	}
+	if len(report.Providers) != 1 || report.Providers[0].Balance.Status != "available" || report.Providers[0].Balance.Category != "ok" {
+		t.Fatalf("balance diagnostic = %#v, want available/ok", report.Providers)
+	}
+}
+
 func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 	var logs bytes.Buffer
 	logger := log.New(&logs, "", 0)

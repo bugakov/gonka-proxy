@@ -60,6 +60,26 @@ providers:
 	}
 }
 
+func TestLoadParsesDiagnosticURLs(t *testing.T) {
+	cfg := loadConfig(t, `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    health_check_url: https://provider.example/v1/models
+    balance_url: https://provider.example/balance
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`)
+	provider := cfg.Providers[0]
+	if provider.HealthCheckURL != "https://provider.example/v1/models" {
+		t.Errorf("HealthCheckURL = %q", provider.HealthCheckURL)
+	}
+	if provider.BalanceURL != "https://provider.example/balance" {
+		t.Errorf("BalanceURL = %q", provider.BalanceURL)
+	}
+}
+
 func TestLoadParsesLogLevel(t *testing.T) {
 	tests := []struct {
 		name    string
