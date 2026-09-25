@@ -41,6 +41,8 @@ type Logger interface {
 // Server implements the public OpenAI-compatible HTTP endpoint.
 type Server struct {
 	providers        []*provider
+	routes           map[string][]*provider
+	legacyModelMode  bool
 	client           *http.Client
 	metrics          *metricsCollector
 	cooldownDuration time.Duration
@@ -84,16 +86,19 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	normalizedEffort := normalizeReasoningEffort(cfg.ReasoningEffort)
 
 	providers := make([]*provider, 0, len(cfg.Providers))
+	providersByName := make(map[string]*provider, len(cfg.Providers))
 	for _, configuredProvider := range cfg.Providers {
 		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("Provider base URL: %w", err)
 		}
-		providers = append(providers, &provider{
+		selected := &provider{
 			Provider:        configuredProvider,
 			chatURL:         chatURL,
 			reasoningEffort: resolveReasoningEffort(normalizedEffort, configuredProvider),
-		})
+		}
+		providers = append(providers, selected)
+		providersByName[selected.Name] = selected
 	}
 	sort.SliceStable(providers, func(i, j int) bool {
 		return providers[i].Priority > providers[j].Priority
@@ -106,8 +111,37 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	transport = transport.Clone()
 	transport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
 
+	routes := make(map[string][]*provider)
+	modelRoutes := cfg.ModelRoutes
+	if len(modelRoutes) == 0 {
+		modelRoutes = map[string]config.ModelRoute{"gonka": {}}
+	}
+	for routeName, modelRoute := range modelRoutes {
+		routeProviders := make([]*provider, 0, len(providers))
+		if len(modelRoute.Providers) == 0 {
+			for _, selected := range providers {
+				if _, ok := selected.ModelAliasFor(routeName); ok {
+					routeProviders = append(routeProviders, selected)
+				}
+			}
+		} else {
+			for _, providerName := range modelRoute.Providers {
+				selected := providersByName[providerName]
+				if selected == nil {
+					continue
+				}
+				if _, ok := selected.ModelAliasFor(routeName); ok {
+					routeProviders = append(routeProviders, selected)
+				}
+			}
+		}
+		routes[routeName] = routeProviders
+	}
+
 	server := &Server{
 		providers:        providers,
+		routes:           routes,
+		legacyModelMode:  len(cfg.ModelRoutes) == 0,
 		cooldownDuration: cfg.Cooldown,
 		recoveryWait:     cfg.RecoveryWait,
 		client: &http.Client{
@@ -193,11 +227,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if len(s.providers) == 0 {
-		http.Error(w, "no Providers configured", http.StatusServiceUnavailable)
-		return
-	}
-
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if r.Context().Err() != nil {
@@ -219,6 +248,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
+	model, err := requestModel(payload)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	routeName := model
+	routeProviders, ok := s.routes[routeName]
+	if !ok && s.legacyModelMode {
+		routeName = "gonka"
+		routeProviders, ok = s.routes[routeName]
+	}
+	if !ok {
+		http.Error(w, fmt.Sprintf("unknown model %q", model), http.StatusNotFound)
+		return
+	}
+	if len(routeProviders) == 0 {
+		http.Error(w, "no Providers configured for model", http.StatusServiceUnavailable)
+		return
+	}
+
 	requestStarted := time.Now()
 	for {
 		if r.Context().Err() != nil {
@@ -226,7 +275,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			return
 		}
 
-		for _, selected := range s.providers {
+		for _, selected := range routeProviders {
 			if r.Context().Err() != nil {
 				s.logCancellation("routing")
 				return
@@ -240,7 +289,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			s.metrics.recordRequestStart(s.metricProviderName(selected))
 			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", s.redactProviderSecrets(selected.Name), selected.Priority)
 
-			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
+			modelAlias, ok := selected.ModelAliasFor(routeName)
+			if !ok {
+				continue
+			}
+			upstreamBody, err := applyUpstreamOverrides(payload, modelAlias, selected.reasoningEffort)
 			if err != nil {
 				http.Error(w, "could not encode upstream request", http.StatusBadGateway)
 				return
@@ -828,6 +881,18 @@ func decodeRequestBody(body []byte) (map[string]json.RawMessage, error) {
 		return nil, fmt.Errorf("decode request body")
 	}
 	return payload, nil
+}
+
+func requestModel(payload map[string]json.RawMessage) (string, error) {
+	rawModel, ok := payload["model"]
+	if !ok {
+		return "gonka", nil
+	}
+	var model string
+	if err := json.Unmarshal(rawModel, &model); err != nil || strings.TrimSpace(model) == "" {
+		return "", fmt.Errorf("model must be a non-empty string")
+	}
+	return strings.TrimSpace(model), nil
 }
 
 func applyUpstreamOverrides(payload map[string]json.RawMessage, modelAlias string, reasoningEffort *config.ReasoningEffort) ([]byte, error) {
