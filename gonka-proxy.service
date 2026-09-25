@@ -1,0 +1,15 @@
+[Unit]
+Description=Gonka Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/scanum/gonka-proxy
+ExecStart=/home/scanum/gonka-proxy/gonka-proxy --config /home/scanum/gonka-proxy/config.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
