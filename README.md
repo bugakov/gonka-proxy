@@ -52,6 +52,21 @@ List your providers in any order; Gonka always tries the **highest `priority` nu
 
 `log_level` is a minimum severity. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation—while `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded provider error message or stream tail; prompts, request bodies, authorization headers, and API keys are never logged, and response content is suppressed at `WARN` and `ERROR`.
 
+## Metrics
+
+The proxy exposes Prometheus-compatible metrics at `GET /metrics` on the same address as the chat endpoint. Keep the listener on loopback when metrics must remain local:
+
+```sh
+curl http://127.0.0.1:58081/metrics
+```
+
+Metrics are grouped by the configured provider name and include successful and failed provider attempts, upstream status/category, failovers, cooldown activations and skips, stream aborts, and latency histograms. The endpoint contains no request bodies, response bodies, authorization headers, or API keys. Useful signals include:
+
+- `gonka_proxy_provider_upstream_responses_total` — upstream status and safe failure category;
+- `gonka_proxy_provider_failovers_total` and `gonka_proxy_provider_cooldowns_total` — provider failures that caused routing changes;
+- `gonka_proxy_provider_stream_aborts_total` — streams cut before the `[DONE]` marker or by a client/upstream read error;
+- `gonka_proxy_provider_request_duration_seconds` — completed request latency per provider.
+
 ## Reasoning effort
 
 `reasoning_effort` hints how much reasoning the upstream model should do. The proxy writes your configured value into every upstream request — whatever the client sends is overwritten. Allowed values: `none`, `low`, `medium`, `high`, `xhigh`, `max`, plus `null` (`~`) to strip the field entirely. The top-level key is **required**.

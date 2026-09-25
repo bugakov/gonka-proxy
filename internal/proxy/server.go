@@ -42,6 +42,7 @@ type Logger interface {
 type Server struct {
 	providers        []*provider
 	client           *http.Client
+	metrics          *metricsCollector
 	cooldownDuration time.Duration
 	recoveryWait     time.Duration
 	cooldownMu       sync.Mutex
@@ -112,6 +113,7 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		client: &http.Client{
 			Transport: transport,
 		},
+		metrics:  newMetricsCollector(),
 		logger:   logger,
 		logLevel: logLevel,
 	}, nil
@@ -139,8 +141,20 @@ func resolveReasoningEffort(global *config.ReasoningEffort, p config.Provider) *
 	return global
 }
 
-// ServeHTTP handles the single MVP endpoint.
+// ServeHTTP handles the chat completion and operational metrics endpoints.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/metrics" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if err := s.metrics.serveHTTP(w); err != nil {
+			s.logAt(config.LogLevelError, "metrics response error - %v", err)
+		}
+		return
+	}
 	if r.URL.Path != chatCompletionsPath {
 		http.NotFound(w, r)
 		return
@@ -176,6 +190,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
+	requestStarted := time.Now()
 	for {
 		if r.Context().Err() != nil {
 			s.logCancellation("routing")
@@ -189,8 +204,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			}
 
 			if !s.providerAvailable(selected, time.Now()) {
+				s.metrics.recordCooldownSkip(s.metricProviderName(selected))
 				continue
 			}
+			attemptStarted := time.Now()
+			s.metrics.recordRequestStart(s.metricProviderName(selected))
 			s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", s.redactProviderSecrets(selected.Name), selected.Priority)
 
 			upstreamBody, err := applyUpstreamOverrides(payload, selected.ModelAlias, selected.reasoningEffort)
@@ -214,6 +232,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 			upstreamResponse, err := s.client.Do(upstreamRequest)
 			if err != nil {
+				s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 				if r.Context().Err() != nil {
 					s.logCancellation("upstream")
 					return
@@ -223,11 +242,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				if isResponseHeaderTimeout(err) {
 					category = "response-header-timeout"
 				}
+				s.metrics.recordResponse(s.metricProviderName(selected), 0, category)
+				s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 				s.handleFailoverFailure(selected, category, 0)
 				continue
 			}
 
 			if upstreamResponse.StatusCode != http.StatusOK {
+				statusCode := upstreamResponse.StatusCode
 				if isFailoverStatus(upstreamResponse.StatusCode) {
 					var errorMessage string
 					if s.payloadLoggingEnabled() {
@@ -248,6 +270,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					case http.StatusTooManyRequests:
 						category = "rate-limit"
 					}
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), statusCode, category)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 					s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
 					continue
 				}
@@ -263,6 +288,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
 
 				if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage, responseBody) {
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), statusCode, "reasoning-effort")
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 					s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
 					continue
 				}
@@ -270,20 +298,34 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				copyHeaders(w.Header(), upstreamResponse.Header)
 				w.WriteHeader(upstreamResponse.StatusCode)
 				_, _ = w.Write(responseBody)
+				s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+				s.metrics.recordResponse(s.metricProviderName(selected), statusCode, "client-error")
+				s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 				return
 			}
 
 			s.logProviderResponse(selected, upstreamResponse.StatusCode, "")
+			s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "success")
 
 			streaming := isStreamingResponse(upstreamResponse, payload)
 			defer upstreamResponse.Body.Close()
 			copyHeaders(w.Header(), upstreamResponse.Header)
 			w.WriteHeader(upstreamResponse.StatusCode)
 			if streaming {
-				s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
+				completed := s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
+				s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+				if completed {
+					s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
+				}
 				return
 			}
-			_, _ = io.Copy(w, upstreamResponse.Body)
+			_, copyErr := io.Copy(w, upstreamResponse.Body)
+			s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+			if copyErr == nil {
+				s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
+			} else {
+				s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+			}
 			return
 		}
 
@@ -417,7 +459,7 @@ func isSSEDoneLine(line []byte) bool {
 		bytes.Equal(line, []byte("data: "+sseDoneMarker))
 }
 
-func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) {
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) bool {
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
@@ -438,7 +480,7 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			if _, writeErr := w.Write(chunk); writeErr != nil {
 				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 					fmt.Sprintf("client-write error: %v", writeErr))
-				return
+				return false
 			}
 			if canFlush {
 				flusher.Flush()
@@ -450,26 +492,28 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 		}
 		if errors.Is(readErr, io.EOF) {
 			if acc.sawDone() {
-				return
+				return true
 			}
 			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
 			s.markCooldown(selected)
-			return
+			return false
 		}
 		if r.Context().Err() != nil {
 			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 				fmt.Sprintf("upstream read error: %v (request context canceled during stream)", readErr))
-			return
+			return false
 		}
 		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 			fmt.Sprintf("upstream read error: %v", readErr))
 		s.handleFailoverFailure(selected, "stream", statusCode)
-		return
+		return false
 	}
 }
 
 func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, reason string) {
+	s.metrics.recordStreamAbort(s.metricProviderName(selected), streamAbortCategory(reason))
+	s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 	providerName := s.redactProviderSecrets(selected.Name)
 	redactedReason := s.redactProviderSecrets(reason)
 	if s.payloadLoggingEnabled() {
@@ -479,6 +523,17 @@ func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes
 	}
 	s.logAt(config.LogLevelWarn, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s",
 		providerName, statusCode, sentBytes, chunks, redactedReason)
+}
+
+func streamAbortCategory(reason string) string {
+	switch {
+	case strings.Contains(reason, "client-write"):
+		return "client-write"
+	case strings.Contains(reason, "without [DONE]"):
+		return "missing-done"
+	default:
+		return "upstream-read"
+	}
 }
 
 func tail(acc *dataChunk) string {
@@ -539,16 +594,22 @@ func (s *Server) markCooldown(selected *provider) {
 		selected.cooldownUntil = cooldownUntil
 	}
 	s.cooldownMu.Unlock()
+	s.metrics.recordCooldown(s.metricProviderName(selected))
 	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", s.redactProviderSecrets(selected.Name), s.cooldownDuration)
 }
 
 func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
+	s.metrics.recordFailover(s.metricProviderName(selected), category)
 	if statusCode > 0 {
 		s.logAt(config.LogLevelWarn, "%s - failover - %s - %d", s.redactProviderSecrets(selected.Name), category, statusCode)
 	} else {
 		s.logAt(config.LogLevelWarn, "%s - failover - %s", s.redactProviderSecrets(selected.Name), category)
 	}
 	s.markCooldown(selected)
+}
+
+func (s *Server) metricProviderName(selected *provider) string {
+	return s.redactProviderSecrets(selected.Name)
 }
 
 func (s *Server) logCancellation(phase string) {

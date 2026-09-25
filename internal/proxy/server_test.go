@@ -22,6 +22,138 @@ import (
 	"github.com/glaicer/gonka-proxy/internal/proxy"
 )
 
+func TestMetricsExposeProviderSuccessAndLatency(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "primary", baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, err := io.ReadAll(metricsResponse.Body)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	if metricsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", metricsResponse.StatusCode, http.StatusOK)
+	}
+	metrics := string(metricsBody)
+	for _, expected := range []string{
+		`gonka_proxy_provider_requests_total{provider="primary",result="success"} 1`,
+		`gonka_proxy_provider_upstream_responses_total{category="success",provider="primary",status="200"} 1`,
+		`gonka_proxy_provider_request_duration_seconds_count{provider="primary"} 1`,
+	} {
+		if !strings.Contains(metrics, expected) {
+			t.Errorf("metrics = %q, want %q", metrics, expected)
+		}
+	}
+	for _, secret := range []string{"provider-secret", "virtual-model", "answer"} {
+		if strings.Contains(metrics, secret) {
+			t.Errorf("metrics contain request/provider data %q: %q", secret, metrics)
+		}
+	}
+}
+
+func TestMetricsExposeFailoverAndCooldown(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backup.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{name: "primary", baseURL: primary.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{name: "backup", baseURL: backup.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, time.Minute, time.Second)
+	defer server.Close()
+
+	post := func() {
+		t.Helper()
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+	post()
+	post()
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, err := io.ReadAll(metricsResponse.Body)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	metrics := string(metricsBody)
+	for _, expected := range []string{
+		`gonka_proxy_provider_upstream_responses_total{category="rate-limit",provider="primary",status="429"} 1`,
+		`gonka_proxy_provider_failovers_total{provider="primary",category="rate-limit"} 1`,
+		`gonka_proxy_provider_cooldowns_total{provider="primary"} 1`,
+		`gonka_proxy_provider_cooldown_skips_total{provider="primary"} 1`,
+	} {
+		if !strings.Contains(metrics, expected) {
+			t.Errorf("metrics = %q, want %q", metrics, expected)
+		}
+	}
+}
+
+func TestMetricsExposeStreamAbort(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"delta\":\"partial\"}\n\n")
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "streaming", baseURL: provider.URL + "/v1", apiKey: "stream-secret", modelAlias: "stream-model", priority: 1},
+	})
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[],"stream":true}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, err := io.ReadAll(metricsResponse.Body)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	if !strings.Contains(string(metricsBody), `gonka_proxy_provider_stream_aborts_total{provider="streaming",reason="missing-done"} 1`) {
+		t.Fatalf("metrics = %q, want missing-done stream abort", metricsBody)
+	}
+}
+
 func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
 	var logs bytes.Buffer
 	logger := log.New(&logs, "", 0)

@@ -50,6 +50,16 @@ The `baseURL` intentionally ends in `/v1`. Do not configure individual upstream 
 
 Logs are written to the container console with timestamps. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation. `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded parsed Provider error message or stream tail that can contain Provider response content; this content is suppressed at `WARN` and `ERROR`. Prompts, request bodies, downstream authorization headers, and Provider API keys are never logged.
 
+## Metrics
+
+The same server exposes Prometheus-compatible metrics at `GET /metrics`. With the compose example, query them locally:
+
+```sh
+curl http://127.0.0.1:58081/metrics
+```
+
+The metrics report per-Provider successes and errors, upstream status/category, failovers, cooldowns, stream aborts, and latency histograms. They do not include request or response bodies, authorization headers, or API keys. Keep the host binding loopback-only if metrics should not be reachable from the network.
+
 ## Container smoke test
 
 The smoke test builds the production image and a fake HTTPS OpenAI-compatible Provider, publishes the proxy on the host loopback interface, then sends a real request through that published endpoint:
