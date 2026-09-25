@@ -93,6 +93,8 @@ providers:
 #     model_aliases:
 #       gonka: deepseek-v4-flash-0731
 #       deepseek-v4-flash-0731: deepseek-v4-flash-0731
+#       glm-5.3-flash: glm-5.3-flash
+#       minimax-m2.7: minimax-m2.7
 #     priority: 100
 # model_routes:
 #   gonka:
@@ -102,3 +104,8 @@ providers:
 #   fallback-model:
 #     providers: [secondary]
 #     fallback: gonka
+#   glm-5.3-flash:
+#     providers: [primary]
+#   minimax-m2.7:
+#     providers: [primary]
+#     # fallback: gonka
