@@ -1067,6 +1067,118 @@ func TestChatCompletionsUsesVirtualModelRouteOrderAndAlias(t *testing.T) {
 	}
 }
 
+func TestInitialVirtualModelsRouteEndToEnd(t *testing.T) {
+	var upstreamModels []string
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		upstreamModels = append(upstreamModels, payload.Model)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"ok"}`)
+	}))
+	defer provider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "gonka-router", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", Priority: 100,
+			ModelAliases: map[string]string{
+				"gonka":                  "deepseek-v4-flash-0731",
+				"deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
+				"glm-5.3-flash":          "glm-5.3-flash",
+				"minimax-m2.7":           "minimax-m2.7",
+			},
+		}},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":                  {Providers: []string{"gonka-router"}},
+			"deepseek-v4-flash-0731": {Providers: []string{"gonka-router"}},
+			"glm-5.3-flash":          {Providers: []string{"gonka-router"}},
+			"minimax-m2.7":           {Providers: []string{"gonka-router"}},
+		},
+		ModelRouteOrder: []string{"gonka", "deepseek-v4-flash-0731", "glm-5.3-flash", "minimax-m2.7"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	requests := []struct {
+		model string
+		alias string
+	}{
+		{model: "gonka", alias: "deepseek-v4-flash-0731"},
+		{model: "deepseek-v4-flash-0731", alias: "deepseek-v4-flash-0731"},
+		{model: "glm-5.3-flash", alias: "glm-5.3-flash"},
+		{model: "minimax-m2.7", alias: "minimax-m2.7"},
+		{model: "", alias: "deepseek-v4-flash-0731"},
+	}
+	for _, request := range requests {
+		body := `{"messages":[]}`
+		if request.model != "" {
+			body = fmt.Sprintf(`{"model":%q,"messages":[]}`, request.model)
+		}
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("request model %q: %v", request.model, err)
+		}
+		if response.StatusCode != http.StatusOK {
+			responseBody, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			t.Fatalf("request model %q status = %d, body = %s", request.model, response.StatusCode, responseBody)
+		}
+		_ = response.Body.Close()
+	}
+	if !reflect.DeepEqual(upstreamModels, []string{
+		"deepseek-v4-flash-0731",
+		"deepseek-v4-flash-0731",
+		"glm-5.3-flash",
+		"minimax-m2.7",
+		"deepseek-v4-flash-0731",
+	}) {
+		t.Fatalf("upstream models = %#v", upstreamModels)
+	}
+
+	modelsResponse, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer modelsResponse.Body.Close()
+	var models struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(modelsResponse.Body).Decode(&models); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	ids := make([]string, 0, len(models.Data))
+	for _, model := range models.Data {
+		ids = append(ids, model.ID)
+	}
+	if !reflect.DeepEqual(ids, []string{"gonka", "deepseek-v4-flash-0731", "glm-5.3-flash", "minimax-m2.7"}) {
+		t.Fatalf("model IDs = %#v", ids)
+	}
+
+	unknown, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"unknown","messages":[]}`))
+	if err != nil {
+		t.Fatalf("unknown model request: %v", err)
+	}
+	defer unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
+	}
+}
+
 func TestModelsListsConfiguredRoutesInDeclarationOrder(t *testing.T) {
 	reasoningMax := config.ReasoningEffortMax
 	handler, err := proxy.New(config.Config{

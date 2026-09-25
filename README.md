@@ -71,6 +71,7 @@ providers:
     api_key: your-key
     model_aliases:
       glm-5.3-flash: glm-5.3-flash
+      minimax-m2.7: minimax-m2.7
     priority: 50
 
 model_routes:
@@ -79,6 +80,8 @@ model_routes:
   deepseek-v4-flash-0731:
     providers: [gonka24]
   glm-5.3-flash:
+    providers: [easy-gonka]
+  minimax-m2.7:
     providers: [easy-gonka]
     # Optional: use another Virtual Model only after this route is exhausted.
     # fallback: gonka
@@ -213,6 +216,10 @@ Every service mounts its config at the same in-container path (`/etc/gonka-proxy
 ```sh
 go run ./cmd/gonka-proxy --config config.yaml
 ```
+
+For a zero-downtime-conscious migration from scalar `model_alias` settings,
+including backup, validation, systemd restart, and rollback checks, see
+[`docs/multi-model-rollout.md`](docs/multi-model-rollout.md).
 
 ## Point your app at it
 
