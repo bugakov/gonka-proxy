@@ -130,6 +130,32 @@ curl http://127.0.0.1:58081/diagnostics
 
 Diagnostics perform a safe `GET` request (by default to `<base_url>/models`) and never send chat messages, prompts, tools, or request bodies. They classify invalid keys, unavailable endpoints, rate/concurrency exhaustion, insufficient balance, and transient failures, with a remediation hint. A provider-specific `balance_url` can be configured when that API exists; otherwise the balance result is reported as `unavailable/unsupported`.
 
+## Provider benchmark
+
+The repository includes a reusable benchmark that tests every model advertised by
+each configured provider. It sends requests sequentially, adds a fresh random
+nonce to every prompt to reduce cache effects, and records discovery status,
+HTTP errors, header/first-byte latency, total latency, and response size. API
+keys, prompts, and response bodies are never written to the report.
+
+Run it from the repository root:
+
+```sh
+go run ./cmd/provider-benchmark \
+  -config config.yaml \
+  -rounds 3 \
+  -delay 500ms \
+  -timeout 45s \
+  -output provider-benchmark.json
+```
+
+The default run performs three sequential short requests per discovered model.
+If a provider does not implement `/models`, the benchmark falls back to its
+configured `model_alias`/`model_aliases` values and marks model discovery as an
+error. CSV output is available with `-format csv`; use it for comparisons in a
+spreadsheet or a later analysis script. The benchmark calls providers directly,
+so proxy fallback does not hide an individual provider's result.
+
 ## Reasoning effort
 
 `reasoning_effort` hints how much reasoning the upstream model should do. The proxy writes your configured value into every upstream request — whatever the client sends is overwritten. Allowed values: `none`, `low`, `medium`, `high`, `xhigh`, `max`, plus `null` (`~`) to strip the field entirely. The top-level key is **required**.
