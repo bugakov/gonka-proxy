@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -152,6 +153,224 @@ func TestMetricsExposeStreamAbort(t *testing.T) {
 	if !strings.Contains(string(metricsBody), `gonka_proxy_provider_stream_aborts_total{provider="streaming",reason="missing-done"} 1`) {
 		t.Fatalf("metrics = %q, want missing-done stream abort", metricsBody)
 	}
+}
+
+func TestHealthSummaryPersistsAcrossProxyRestart(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	healthPath := filepath.Join(t.TempDir(), "health-history.json")
+	newHandler := func(t *testing.T) http.Handler {
+		t.Helper()
+		reasoningMax := config.ReasoningEffortMax
+		handler, err := proxy.NewWithLogger(config.Config{
+			ListenAddress:         "127.0.0.1:8080",
+			HealthHistoryPath:     healthPath,
+			Cooldown:              time.Second,
+			RecoveryWait:          time.Second,
+			ResponseHeaderTimeout: time.Second,
+			ReasoningEffort:       &reasoningMax,
+			Providers: []config.Provider{
+				{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", ModelAlias: "provider-model", Priority: 1},
+			},
+		}, log.Default())
+		if err != nil {
+			t.Fatalf("create proxy: %v", err)
+		}
+		return handler
+	}
+
+	first := httptest.NewServer(newHandler(t))
+	response, err := http.Post(first.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("first proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	first.Close()
+
+	second := httptest.NewServer(newHandler(t))
+	defer second.Close()
+	healthResponse, err := http.Get(second.URL + "/health")
+	if err != nil {
+		t.Fatalf("health request: %v", err)
+	}
+	defer healthResponse.Body.Close()
+	healthBody, err := io.ReadAll(healthResponse.Body)
+	if err != nil {
+		t.Fatalf("read health summary: %v", err)
+	}
+	if healthResponse.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", healthResponse.StatusCode, http.StatusOK)
+	}
+	for _, expected := range []string{
+		`provider "primary": status=healthy`,
+		`successes=1`,
+		`last_success=`,
+	} {
+		if !strings.Contains(string(healthBody), expected) {
+			t.Errorf("health summary = %q, want %q", healthBody, expected)
+		}
+	}
+}
+
+func TestHealthSummaryShowsDegradationAndRecovery(t *testing.T) {
+	const cooldown = 30 * time.Millisecond
+	var primaryHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if primaryHits.Add(1) == 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"primary"}`)
+	}))
+	defer primary.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backup.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{name: "primary", baseURL: primary.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{name: "backup", baseURL: backup.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, cooldown, time.Second)
+	defer server.Close()
+
+	post := func() {
+		t.Helper()
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+	post()
+	post()
+	health := func() string {
+		t.Helper()
+		response, err := http.Get(server.URL + "/health")
+		if err != nil {
+			t.Fatalf("health request: %v", err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read health summary: %v", err)
+		}
+		return string(body)
+	}
+	degraded := health()
+	if !strings.Contains(degraded, `provider "primary": status=degraded`) || !strings.Contains(degraded, `category=server-error`) {
+		t.Fatalf("degraded health = %q", degraded)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for primaryHits.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("primary provider did not become available")
+		}
+		post()
+		time.Sleep(5 * time.Millisecond)
+	}
+	recovered := health()
+	if !strings.Contains(recovered, `provider "primary": status=healthy`) {
+		t.Fatalf("recovered health = %q", recovered)
+	}
+}
+
+func TestHealthHistoryRetentionAndStorageFailureDoNotBlockRouting(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"answer":"ok"}`)
+	}))
+	defer provider.Close()
+
+	func() {
+		historyPath := filepath.Join(t.TempDir(), "health-history.json")
+		savedAt := time.Now().Add(-2 * time.Second)
+		events := make([]map[string]any, 1005)
+		for index := range events {
+			events[index] = map[string]any{
+				"at":       savedAt.Add(time.Duration(index-1004) * time.Millisecond),
+				"provider": "primary",
+				"type":     "success",
+			}
+		}
+		historyData, err := json.Marshal(map[string]any{
+			"version":   1,
+			"saved_at":  savedAt,
+			"providers": map[string]any{"primary": map[string]any{}},
+			"events":    events,
+		})
+		if err != nil {
+			t.Fatalf("encode seeded health history: %v", err)
+		}
+		if err := os.WriteFile(historyPath, historyData, 0o600); err != nil {
+			t.Fatalf("seed health history: %v", err)
+		}
+		reasoningMax := config.ReasoningEffortMax
+		handler, err := proxy.NewWithLogger(config.Config{
+			ListenAddress: "127.0.0.1:8080", HealthHistoryPath: historyPath,
+			Cooldown: time.Second, RecoveryWait: time.Second, ResponseHeaderTimeout: time.Second,
+			ReasoningEffort: &reasoningMax,
+			Providers:       []config.Provider{{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "secret", ModelAlias: "model", Priority: 1}},
+		}, log.Default())
+		if err != nil {
+			t.Fatalf("create proxy: %v", err)
+		}
+		server := httptest.NewServer(handler)
+		defer server.Close()
+		response, requestErr := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual","messages":[]}`))
+		if requestErr != nil {
+			t.Fatalf("retention request: %v", requestErr)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		data, err := os.ReadFile(historyPath)
+		if err != nil {
+			t.Fatalf("read health history: %v", err)
+		}
+		var history struct {
+			Events []json.RawMessage `json:"events"`
+		}
+		if err := json.Unmarshal(data, &history); err != nil {
+			t.Fatalf("decode health history: %v", err)
+		}
+		if len(history.Events) > 1000 {
+			t.Fatalf("history events = %d, want at most 1000", len(history.Events))
+		}
+	}()
+
+	storagePath := filepath.Join(t.TempDir(), "not-a-file")
+	if err := os.Mkdir(storagePath, 0o700); err != nil {
+		t.Fatalf("create storage directory: %v", err)
+	}
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress: "127.0.0.1:8080", HealthHistoryPath: storagePath,
+		Cooldown: time.Second, RecoveryWait: time.Second, ResponseHeaderTimeout: time.Second,
+		ReasoningEffort: &reasoningMax,
+		Providers:       []config.Provider{{Name: "primary", BaseURL: provider.URL + "/v1", APIKey: "secret", ModelAlias: "model", Priority: 1}},
+	}, log.Default())
+	if err != nil {
+		t.Fatalf("create proxy with broken storage: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual","messages":[]}`))
+	if err != nil {
+		t.Fatalf("routing with broken storage: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("routing status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	_ = response.Body.Close()
 }
 
 func TestChatCompletionsLogsSafeOperationalEvents(t *testing.T) {
@@ -2722,6 +2941,7 @@ func newProxyServerWithTimingValuesAndRecovery(t *testing.T, providers []provide
 	if responseHeaderTimeout != "" {
 		fmt.Fprintf(&yaml, "response_header_timeout: %s\n", responseHeaderTimeout)
 	}
+	fmt.Fprintf(&yaml, "health_history_path: %q\n", filepath.Join(t.TempDir(), "health-history.json"))
 	yaml.WriteString("reasoning_effort: max\n")
 	yaml.WriteString("providers:\n")
 	for index, provider := range providers {

@@ -18,6 +18,7 @@ const (
 	DefaultRecoveryWait          = 30 * time.Second
 	DefaultResponseHeaderTimeout = 30 * time.Second
 	DefaultLogLevel              = "WARN"
+	DefaultHealthHistoryPath     = "health-history.json"
 )
 
 // LogLevel is a configurable minimum severity threshold. Lines at or above
@@ -105,6 +106,7 @@ type Config struct {
 	RecoveryWait          time.Duration
 	ResponseHeaderTimeout time.Duration
 	LogLevel              LogLevel
+	HealthHistoryPath     string
 	ReasoningEffort       *ReasoningEffort
 	Providers             []Provider
 }
@@ -129,6 +131,7 @@ type rawConfig struct {
 	RecoveryWait          string        `yaml:"recovery_wait"`
 	ResponseHeaderTimeout string        `yaml:"response_header_timeout"`
 	LogLevel              string        `yaml:"log_level"`
+	HealthHistoryPath     string        `yaml:"health_history_path"`
 	ReasoningEffort       *string       `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
 	Providers             []rawProvider `yaml:"providers"`
 }
@@ -200,11 +203,15 @@ func Load(path string) (Config, error) {
 		RecoveryWait:          0,
 		ResponseHeaderTimeout: 0,
 		LogLevel:              LogLevel(DefaultLogLevel),
+		HealthHistoryPath:     strings.TrimSpace(raw.HealthHistoryPath),
 		ReasoningEffort:       parsedReasoningEffort,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
 	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = DefaultListenAddress
+	}
+	if cfg.HealthHistoryPath == "" {
+		cfg.HealthHistoryPath = DefaultHealthHistoryPath
 	}
 
 	if cfg.Cooldown, err = parseDuration("cooldown", raw.Cooldown, DefaultCooldown); err != nil {

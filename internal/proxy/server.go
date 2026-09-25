@@ -106,17 +106,22 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	transport = transport.Clone()
 	transport.ResponseHeaderTimeout = cfg.ResponseHeaderTimeout
 
-	return &Server{
+	server := &Server{
 		providers:        providers,
 		cooldownDuration: cfg.Cooldown,
 		recoveryWait:     cfg.RecoveryWait,
 		client: &http.Client{
 			Transport: transport,
 		},
-		metrics:  newMetricsCollector(),
 		logger:   logger,
 		logLevel: logLevel,
-	}, nil
+	}
+	providerNames := make([]string, 0, len(providers))
+	for _, configuredProvider := range providers {
+		providerNames = append(providerNames, server.redactProviderSecrets(configuredProvider.Name))
+	}
+	server.metrics = newMetricsCollector(cfg.HealthHistoryPath, providerNames, logger)
+	return server, nil
 }
 
 // normalizeReasoningEffort normalizes an effort pointer so programmatic
@@ -152,6 +157,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		if err := s.metrics.serveHTTP(w); err != nil {
 			s.logAt(config.LogLevelError, "metrics response error - %v", err)
+		}
+		return
+	}
+	if r.URL.Path == "/health" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if err := s.metrics.serveHealth(w); err != nil {
+			s.logAt(config.LogLevelError, "health response error - %v", err)
 		}
 		return
 	}
@@ -389,6 +406,7 @@ func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 	}
 	s.cooldownMu.Unlock()
 	for _, selected := range cleared {
+		s.metrics.recordCooldownCleared(s.metricProviderName(selected))
 		s.logAt(config.LogLevelInfo, "%s - cooldown cleared", s.redactProviderSecrets(selected.Name))
 	}
 	return len(cleared)
@@ -594,7 +612,7 @@ func (s *Server) markCooldown(selected *provider) {
 		selected.cooldownUntil = cooldownUntil
 	}
 	s.cooldownMu.Unlock()
-	s.metrics.recordCooldown(s.metricProviderName(selected))
+	s.metrics.recordCooldown(s.metricProviderName(selected), cooldownUntil)
 	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", s.redactProviderSecrets(selected.Name), s.cooldownDuration)
 }
 

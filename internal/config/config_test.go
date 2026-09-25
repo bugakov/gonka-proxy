@@ -39,6 +39,9 @@ providers:
 	if cfg.LogLevel != config.LogLevelWarn {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, config.LogLevelWarn)
 	}
+	if cfg.HealthHistoryPath != config.DefaultHealthHistoryPath {
+		t.Errorf("HealthHistoryPath = %q, want %q", cfg.HealthHistoryPath, config.DefaultHealthHistoryPath)
+	}
 }
 
 func TestLoadParsesRecoveryWait(t *testing.T) {

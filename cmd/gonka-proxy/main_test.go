@@ -135,12 +135,15 @@ func TestRunShutsDownActiveRoutingOnContextCancellation(t *testing.T) {
 	defer provider.Close()
 
 	listenAddress := reserveTCPAddress(t)
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	testDir := t.TempDir()
+	configPath := filepath.Join(testDir, "config.yaml")
+	healthHistoryPath := filepath.Join(testDir, "health-history.json")
 	config := fmt.Sprintf(`server:
   listen_address: %s
 cooldown: 1h
 recovery_wait: 1h
 response_header_timeout: 1h
+health_history_path: %q
 reasoning_effort: max
 providers:
   - name: primary
@@ -148,7 +151,7 @@ providers:
     api_key: provider-secret
     model_alias: provider-model
     priority: 1
-`, listenAddress, provider.URL)
+`, listenAddress, healthHistoryPath, provider.URL)
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

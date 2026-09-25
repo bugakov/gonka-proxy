@@ -32,6 +32,7 @@ cooldown: 120s            # how long a failed provider is benched before retry
 recovery_wait: 30s        # wait before probing again when all providers are down
 response_header_timeout: 30s  # max time to wait for a provider's response headers
 log_level: WARN           # INFO, WARN (default), or ERROR
+health_history_path: health-history.json  # persistent provider health history
 
 reasoning_effort: xhigh   # required; see "Reasoning effort" below
 
@@ -66,6 +67,14 @@ Metrics are grouped by the configured provider name and include successful and f
 - `gonka_proxy_provider_failovers_total` and `gonka_proxy_provider_cooldowns_total` — provider failures that caused routing changes;
 - `gonka_proxy_provider_stream_aborts_total` — streams cut before the `[DONE]` marker or by a client/upstream read error;
 - `gonka_proxy_provider_request_duration_seconds` — completed request latency per provider.
+
+For a human-readable current summary, use `GET /health`:
+
+```sh
+curl http://127.0.0.1:58081/health
+```
+
+The summary includes each provider's healthy/degraded/unavailable status, last success and error, cooldown transitions, request/error counts, and latency averages. The state is stored in `health_history_path`; writes use an atomic replacement and are best-effort, so an unavailable or read-only path does not stop routing. Events older than 30 days and entries beyond the latest 1,000 are removed.
 
 ## Reasoning effort
 

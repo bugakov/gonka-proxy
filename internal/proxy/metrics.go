@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var metricLatencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
@@ -14,6 +15,7 @@ var metricLatencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1
 type metricsCollector struct {
 	mu        sync.Mutex
 	providers map[string]*providerMetrics
+	health    *healthStore
 }
 
 type providerMetrics struct {
@@ -39,8 +41,11 @@ type metricHistogram struct {
 	count   uint64
 }
 
-func newMetricsCollector() *metricsCollector {
-	return &metricsCollector{providers: make(map[string]*providerMetrics)}
+func newMetricsCollector(historyPath string, providerNames []string, logger Logger) *metricsCollector {
+	return &metricsCollector{
+		providers: make(map[string]*providerMetrics),
+		health:    newHealthStore(historyPath, providerNames, logger),
+	}
 }
 
 func (m *metricsCollector) provider(name string) *providerMetrics {
@@ -73,21 +78,27 @@ func (m *metricsCollector) recordRequestStart(name string) {
 
 func (m *metricsCollector) recordRequest(name, result string, durationSeconds float64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	provider := m.provider(name)
 	provider.requests[result]++
 	if result == "success" {
 		recordHistogram(&provider.requestLatency, durationSeconds)
 	}
+	m.mu.Unlock()
+	if result == "success" {
+		m.health.recordSuccess(name, time.Now(), durationSeconds)
+	}
 }
 
 func (m *metricsCollector) recordResponse(name string, statusCode int, category string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.provider(name).upstreamResponses[responseMetricKey{
 		status:   strconv.Itoa(statusCode),
 		category: category,
 	}]++
+	m.mu.Unlock()
+	if category != "success" && category != "client-error" {
+		m.health.recordError(name, category, statusCode, time.Now())
+	}
 }
 
 func (m *metricsCollector) recordFailover(name, category string) {
@@ -96,10 +107,11 @@ func (m *metricsCollector) recordFailover(name, category string) {
 	m.provider(name).failovers[category]++
 }
 
-func (m *metricsCollector) recordCooldown(name string) {
+func (m *metricsCollector) recordCooldown(name string, until time.Time) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.provider(name).cooldowns++
+	m.mu.Unlock()
+	m.health.recordCooldown(name, until, time.Now())
 }
 
 func (m *metricsCollector) recordCooldownSkip(name string) {
@@ -110,8 +122,13 @@ func (m *metricsCollector) recordCooldownSkip(name string) {
 
 func (m *metricsCollector) recordStreamAbort(name, reason string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.provider(name).streamAborts[reason]++
+	m.mu.Unlock()
+	m.health.recordError(name, reason, 0, time.Now())
+}
+
+func (m *metricsCollector) recordCooldownCleared(name string) {
+	m.health.recordCooldownCleared(name, time.Now())
 }
 
 func (m *metricsCollector) serveHTTP(w io.Writer) error {
@@ -187,6 +204,10 @@ func (m *metricsCollector) serveHTTP(w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+func (m *metricsCollector) serveHealth(w io.Writer) error {
+	return m.health.serveHTTP(w)
 }
 
 func recordHistogram(histogram *metricHistogram, value float64) {

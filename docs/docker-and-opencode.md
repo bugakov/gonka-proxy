@@ -12,7 +12,7 @@ Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root,
 
 Configuration is loaded and validated once during process startup. Edit the mounted file, then restart the container to apply changes; there is no hot reload.
 
-When omitted, `cooldown` defaults to 120s, `recovery_wait` to 30s, `response_header_timeout` to 30s, and `log_level` to `WARN`.
+When omitted, `cooldown` defaults to 120s, `recovery_wait` to 30s, `response_header_timeout` to 30s, and `log_level` to `WARN`. `health_history_path` defaults to `health-history.json`.
 
 ## Docker Compose
 
@@ -59,6 +59,8 @@ curl http://127.0.0.1:58081/metrics
 ```
 
 The metrics report per-Provider successes and errors, upstream status/category, failovers, cooldowns, stream aborts, and latency histograms. They do not include request or response bodies, authorization headers, or API keys. Keep the host binding loopback-only if metrics should not be reachable from the network.
+
+For a human-readable provider summary, query `GET /health`. It reports current status, last success/error, cooldown transitions, counts, and latency averages. Health history is persisted at `health_history_path` with a 30-day/1,000-event retention limit. Persistence is best-effort: a broken path is logged but does not interrupt proxy routing.
 
 ## Container smoke test
 
