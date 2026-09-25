@@ -80,9 +80,13 @@ model_routes:
     providers: [gonka24]
   glm-5.3-flash:
     providers: [easy-gonka]
+    # Optional: use another Virtual Model only after this route is exhausted.
+    # fallback: gonka
 ```
 
 The request's `model` selects a Model Route. A missing `model` selects `gonka`; an unknown model returns `404` when `model_routes` is configured. A legacy configuration containing only scalar `model_alias` values continues to route through `gonka` and retains the previous behavior.
+
+Fallback is opt-in. Each route can name one fallback route, and fallback chains are allowed; unknown targets and cycles are rejected at startup. A route is visited at most once per request. Transitions are exposed in `/metrics`, `/health`, and `/diagnostics`.
 
 Agents can discover the configured Virtual Models through the OpenAI-compatible endpoint:
 

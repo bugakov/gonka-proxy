@@ -73,3 +73,4 @@ providers:
 #     providers: [primary]
 #   deepseek-v4-flash-0731:
 #     providers: [primary]
+#     # fallback: gonka

@@ -29,6 +29,14 @@ type healthStore struct {
 	logger             Logger
 	persistenceWarning bool
 	lastPersist        time.Time
+	routeFallbacks     []routeFallbackEvent
+}
+
+type routeFallbackEvent struct {
+	At        time.Time `json:"at"`
+	FromRoute string    `json:"from_route"`
+	ToRoute   string    `json:"to_route"`
+	Reason    string    `json:"reason"`
 }
 
 type healthProviderState struct {
@@ -58,10 +66,11 @@ type healthEvent struct {
 }
 
 type healthHistoryFile struct {
-	Version   int                             `json:"version"`
-	SavedAt   time.Time                       `json:"saved_at"`
-	Providers map[string]*healthProviderState `json:"providers"`
-	Events    []healthEvent                   `json:"events,omitempty"`
+	Version        int                             `json:"version"`
+	SavedAt        time.Time                       `json:"saved_at"`
+	Providers      map[string]*healthProviderState `json:"providers"`
+	Events         []healthEvent                   `json:"events,omitempty"`
+	RouteFallbacks []routeFallbackEvent            `json:"route_fallbacks,omitempty"`
 }
 
 func newHealthStore(path string, providerNames []string, logger Logger) *healthStore {
@@ -148,6 +157,28 @@ func (h *healthStore) recordCooldownCleared(name string, at time.Time) {
 	h.persistLocked(at, true)
 }
 
+func (h *healthStore) recordRouteFallback(fromRoute, toRoute, reason string, at time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.routeFallbacks = append(h.routeFallbacks, routeFallbackEvent{
+		At: at, FromRoute: fromRoute, ToRoute: toRoute, Reason: reason,
+	})
+	if len(h.routeFallbacks) > healthHistoryMaxEvents {
+		h.routeFallbacks = h.routeFallbacks[len(h.routeFallbacks)-healthHistoryMaxEvents:]
+	}
+	h.persistLocked(at, true)
+}
+
+func (h *healthStore) lastRouteFallback() *routeFallbackEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.routeFallbacks) == 0 {
+		return nil
+	}
+	last := h.routeFallbacks[len(h.routeFallbacks)-1]
+	return &last
+}
+
 func (h *healthStore) serveHTTP(w io.Writer) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -160,6 +191,12 @@ func (h *healthStore) serveHTTP(w io.Writer) error {
 	now := time.Now()
 	if _, err := fmt.Fprintf(w, "Gonka Proxy provider health\ngenerated_at=%s\n", now.UTC().Format(time.RFC3339)); err != nil {
 		return err
+	}
+	if len(h.routeFallbacks) > 0 {
+		last := h.routeFallbacks[len(h.routeFallbacks)-1]
+		if _, err := fmt.Fprintf(w, "\nlast_route_fallback=%s from=%q to=%q reason=%s\n", last.At.UTC().Format(time.RFC3339), last.FromRoute, last.ToRoute, last.Reason); err != nil {
+			return err
+		}
 	}
 	for _, name := range names {
 		provider := h.providers[name]
@@ -229,6 +266,10 @@ func (h *healthStore) load() {
 			h.providers[name] = provider
 		}
 	}
+	h.routeFallbacks = history.RouteFallbacks
+	if len(h.routeFallbacks) > healthHistoryMaxEvents {
+		h.routeFallbacks = h.routeFallbacks[len(h.routeFallbacks)-healthHistoryMaxEvents:]
+	}
 	h.events = history.Events
 	h.pruneEvents(time.Now())
 	h.lastPersist = history.SavedAt
@@ -243,10 +284,11 @@ func (h *healthStore) persistLocked(now time.Time, force bool) {
 		return
 	}
 	history := healthHistoryFile{
-		Version:   healthHistoryVersion,
-		SavedAt:   now,
-		Providers: h.providers,
-		Events:    h.events,
+		Version:        healthHistoryVersion,
+		SavedAt:        now,
+		Providers:      h.providers,
+		Events:         h.events,
+		RouteFallbacks: h.routeFallbacks,
 	}
 	data, err := json.MarshalIndent(history, "", "  ")
 	if err == nil {

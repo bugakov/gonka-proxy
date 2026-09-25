@@ -1125,6 +1125,148 @@ func TestModelsListsConfiguredRoutesInDeclarationOrder(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsUsesFallbackRouteAndReportsTransition(t *testing.T) {
+	var primaryHits atomic.Int32
+	var fallbackHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"fallback"}`)
+	}))
+	defer fallback.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: primary.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "primary-model"}, Priority: 100},
+			{Name: "fallback", BaseURL: fallback.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "fallback-model"}, Priority: 50},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != `{"provider":"fallback"}` {
+		t.Fatalf("response = (%d, %s), want fallback success", response.StatusCode, body)
+	}
+	if primaryHits.Load() != 1 || fallbackHits.Load() != 1 {
+		t.Fatalf("provider hits = (%d, %d), want (1, 1)", primaryHits.Load(), fallbackHits.Load())
+	}
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, _ := io.ReadAll(metricsResponse.Body)
+	if !strings.Contains(string(metricsBody), `gonka_proxy_route_fallback_total{from_route="route-a",reason="server-error",to_route="route-b"} 1`) {
+		t.Fatalf("metrics = %s", metricsBody)
+	}
+
+	healthResponse, err := http.Get(server.URL + "/health")
+	if err != nil {
+		t.Fatalf("health request: %v", err)
+	}
+	defer healthResponse.Body.Close()
+	healthBody, _ := io.ReadAll(healthResponse.Body)
+	if !strings.Contains(string(healthBody), `last_route_fallback=`) || !strings.Contains(string(healthBody), `from="route-a" to="route-b" reason=server-error`) {
+		t.Fatalf("health = %s", healthBody)
+	}
+
+	diagnosticsResponse, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer diagnosticsResponse.Body.Close()
+	var diagnostics struct {
+		RouteFallbacks []struct {
+			FromRoute string `json:"from_route"`
+			ToRoute   string `json:"to_route"`
+			Reason    string `json:"reason"`
+			Count     uint64 `json:"count"`
+		} `json:"route_fallbacks"`
+	}
+	if err := json.NewDecoder(diagnosticsResponse.Body).Decode(&diagnostics); err != nil {
+		t.Fatalf("decode diagnostics: %v", err)
+	}
+	if len(diagnostics.RouteFallbacks) != 1 || diagnostics.RouteFallbacks[0].FromRoute != "route-a" || diagnostics.RouteFallbacks[0].ToRoute != "route-b" || diagnostics.RouteFallbacks[0].Count != 1 {
+		t.Fatalf("diagnostics fallback summary = %#v", diagnostics.RouteFallbacks)
+	}
+}
+
+func TestChatCompletionsReturnsFinalFailureAfterFallbackChain(t *testing.T) {
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer firstProvider.Close()
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer secondProvider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: firstProvider.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "model-a"}, Priority: 2},
+			{Name: "fallback", BaseURL: secondProvider.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "model-b"}, Priority: 1},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"route-a","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", response.StatusCode)
+	}
+	if !strings.Contains(string(body), "all Providers failed: server-error") {
+		t.Fatalf("body = %q", body)
+	}
+}
+
 func TestModelsListsLegacyGonkaRouteWithoutProviderDetails(t *testing.T) {
 	reasoningMax := config.ReasoningEffortMax
 	handler, err := proxy.New(config.Config{
