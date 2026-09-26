@@ -23,9 +23,27 @@ type Options struct {
 	Timeout      time.Duration
 	Delay        time.Duration
 	PromptPrefix string
+	// Providers restricts the run to the named providers; empty means all.
+	Providers []string
+	// Models restricts the run to the named models; empty means all.
+	Models []string
+	// Match keeps only models whose name contains it, case-insensitively.
+	Match string
+	// DiscoverOnly resolves model lists without sending chat requests.
+	DiscoverOnly bool
 	Now          func() time.Time
 	Rand         func([]byte) (int, error)
 }
+
+// Model sources reported in ProviderResult.ModelSource.
+const (
+	// ModelSourceEndpoint means the list came from the provider /models endpoint.
+	ModelSourceEndpoint = "endpoint"
+	// ModelSourceConfig means the list came from the provider `models` config key.
+	ModelSourceConfig = "config"
+	// ModelSourceLegacy means the list came from model_alias/model_aliases.
+	ModelSourceLegacy = "legacy"
+)
 
 // Report is a machine-readable benchmark result. It deliberately excludes
 // provider URLs, API keys, prompts, and response bodies.
@@ -40,6 +58,7 @@ type Report struct {
 type ProviderResult struct {
 	Provider        string      `json:"provider"`
 	Models          []string    `json:"models,omitempty"`
+	ModelSource     string      `json:"model_source,omitempty"`
 	DiscoveryStatus string      `json:"discovery_status"`
 	DiscoveryError  string      `json:"discovery_error,omitempty"`
 	Runs            []RunResult `json:"runs,omitempty"`
@@ -59,7 +78,7 @@ type RunResult struct {
 	ResponseBytes      int64     `json:"response_bytes,omitempty"`
 }
 
-// Run discovers models and tests each discovered model sequentially.
+// Run resolves one model list per provider and tests each model sequentially.
 func Run(ctx context.Context, cfg config.Config, options Options) (Report, error) {
 	options = options.withDefaults()
 	report := Report{
@@ -71,18 +90,30 @@ func Run(ctx context.Context, cfg config.Config, options Options) (Report, error
 
 	client := &http.Client{Timeout: options.Timeout}
 	for _, provider := range cfg.Providers {
+		if !options.wantsProvider(provider.Name) {
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
 		result := ProviderResult{Provider: provider.Name, DiscoveryStatus: "error"}
-		models, err := discoverModels(ctx, client, provider)
-		if err != nil {
-			result.DiscoveryError = classifyError(err)
-			models = configuredModels(provider)
+		models, source, discoveryErr := resolveModels(ctx, client, provider)
+		if discoveryErr != nil {
+			result.DiscoveryError = classifyError(discoveryErr)
 		} else {
 			result.DiscoveryStatus = "success"
 		}
+		models = options.filterModels(models)
+		if options.hasModelFilter() && len(models) == 0 && !options.DiscoverOnly {
+			continue
+		}
+		result.ModelSource = source
 		result.Models = models
+
+		if options.DiscoverOnly {
+			report.Results = append(report.Results, result)
+			continue
+		}
 
 		for _, model := range models {
 			for round := 1; round <= options.Rounds; round++ {
@@ -130,6 +161,65 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
+// resolveModels picks the model list for one provider. A working /models
+// endpoint wins; otherwise the configured `models` list is used, then the
+// legacy model_alias/model_aliases values. The endpoint error, when any, is
+// returned alongside the fallback list so it can be reported.
+func resolveModels(ctx context.Context, client *http.Client, provider config.Provider) ([]string, string, error) {
+	models, err := discoverModels(ctx, client, provider)
+	if err == nil {
+		return models, ModelSourceEndpoint, nil
+	}
+	if configured := providerModels(provider); len(configured) > 0 {
+		return configured, ModelSourceConfig, err
+	}
+	legacy := legacyModels(provider)
+	if len(legacy) == 0 {
+		return nil, "", err
+	}
+	return legacy, ModelSourceLegacy, err
+}
+
+func (o Options) wantsProvider(name string) bool {
+	if len(o.Providers) == 0 {
+		return true
+	}
+	for _, wanted := range o.Providers {
+		if wanted == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (o Options) hasModelFilter() bool {
+	return len(o.Models) > 0 || strings.TrimSpace(o.Match) != ""
+}
+
+func (o Options) filterModels(models []string) []string {
+	if !o.hasModelFilter() || len(models) == 0 {
+		return models
+	}
+	wanted := make(map[string]struct{}, len(o.Models))
+	for _, model := range o.Models {
+		wanted[model] = struct{}{}
+	}
+	match := strings.ToLower(strings.TrimSpace(o.Match))
+	filtered := make([]string, 0, len(models))
+	for _, model := range models {
+		if len(wanted) > 0 {
+			if _, ok := wanted[model]; !ok {
+				continue
+			}
+		}
+		if match != "" && !strings.Contains(strings.ToLower(model), match) {
+			continue
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
+}
+
 func discoverModels(ctx context.Context, client *http.Client, provider config.Provider) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint(provider.BaseURL, "models"), nil)
 	if err != nil {
@@ -170,19 +260,43 @@ func discoverModels(ctx context.Context, client *http.Client, provider config.Pr
 	return models, nil
 }
 
-func configuredModels(provider config.Provider) []string {
+// providerModels returns the explicit upstream model list from the config.
+func providerModels(provider config.Provider) []string {
+	if len(provider.Models) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(provider.Models))
+	seen := make(map[string]struct{}, len(provider.Models))
+	for _, model := range provider.Models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		models = append(models, model)
+	}
+	return models
+}
+
+// legacyModels falls back to the alias values when neither the endpoint nor an
+// explicit `models` list is available. model_aliases maps a Virtual Model to an
+// upstream name, so the upstream values are what the benchmark must send.
+func legacyModels(provider config.Provider) []string {
 	seen := map[string]struct{}{}
 	models := make([]string, 0, len(provider.ModelAliases)+1)
 	if model := strings.TrimSpace(provider.ModelAlias); model != "" {
 		models = append(models, model)
 		seen[model] = struct{}{}
 	}
-	for model := range provider.ModelAliases {
-		model = strings.TrimSpace(model)
-		if model != "" {
-			if _, ok := seen[model]; !ok {
-				models = append(models, model)
-				seen[model] = struct{}{}
+	for _, alias := range provider.ModelAliases {
+		alias = strings.TrimSpace(alias)
+		if alias != "" {
+			if _, ok := seen[alias]; !ok {
+				models = append(models, alias)
+				seen[alias] = struct{}{}
 			}
 		}
 	}
