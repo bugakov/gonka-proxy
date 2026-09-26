@@ -43,11 +43,29 @@ providers:
     base_url: https://provider.example/v1
     api_key: replace-with-provider-key
     model_alias: provider-model-name
+    # Optional upstream model list used by cmd/provider-benchmark when the
+    # provider has no working /models endpoint. Entries must be unique.
+    # models:
+    #   - provider-model-name
+    #   - another-model-name
     priority: 100
     # Optional safe GET endpoint for /diagnostics; defaults to base_url/models.
     # health_check_url: https://provider.example/v1/models
     # Optional provider-specific balance endpoint. Omit when unsupported.
     # balance_url: https://provider.example/v1/balance
+    # Optional per-Virtual-Model effort, for brokers that validate the parameter
+    # per model. A value overrides reasoning_effort for that model; ~ strips it
+    # for that model only. Models without an entry keep the provider value.
+    # model_reasoning_effort:
+    #   gemma-4-31b-it: ~    # this deployment rejects reasoning_effort
+    #   qwen3.8-27b: low     # this deployment rejects high/xhigh/max
+    # Optional capacity this upstream accepts per Virtual Model, keyed like
+    # model_aliases. Brokers disagree per model and some publish nothing, so
+    # declare only what you verified: a route publishes the smallest declared
+    # value among its providers, and an omitted dimension stays unpublished.
+    # model_limits:
+    #   qwen3.8-27b: {context: 262144, output: 16384}
+    #   gemma-4-31b-it: {context: 262144}   # this one publishes no output cap
   - name: backup
     base_url: https://backup.example/v1
     api_key: replace-with-provider-key

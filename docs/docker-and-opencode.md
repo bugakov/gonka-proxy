@@ -62,7 +62,7 @@ The metrics report per-Provider successes and errors, upstream status/category, 
 
 For a human-readable provider summary, query `GET /health`. It reports current status, last success/error, cooldown transitions, counts, and latency averages. Health history is persisted at `health_history_path` with a 30-day/1,000-event retention limit. Persistence is best-effort: a broken path is logged but does not interrupt proxy routing.
 
-For active diagnostics, query `GET /diagnostics`. The proxy sends only authenticated `GET` checks to each provider (default `<base_url>/models`), never chat prompts or tools. Configure an optional provider `balance_url` for upstreams that expose a balance API; omitted capability is reported as `unavailable/unsupported`.
+For active diagnostics, query `GET /diagnostics`. The proxy sends only authenticated `GET` checks to each provider (default `<base_url>/models`), never chat prompts or tools. Configure an optional provider `balance_url` for upstreams that expose a balance API; omitted capability is reported as `unavailable/unsupported`. Every report also includes an `observed` block summarizing the last 24 hours of recorded traffic (successes, failures, error categories, cooldown, latency) straight from local history, so it costs no extra upstream request.
 
 ## Container smoke test
 

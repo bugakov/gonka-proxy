@@ -22,6 +22,10 @@ const (
 	DefaultHealthHistoryPath     = "health-history.json"
 )
 
+// LegacyVirtualModel is the Virtual Model a configuration without model_routes
+// serves, which lets a legacy provider keep per-model settings.
+const LegacyVirtualModel = "gonka"
+
 // LogLevel is a configurable minimum severity threshold. Lines at or above
 // this threshold are emitted. Valid values are INFO, WARN, and ERROR.
 type LogLevel string
@@ -100,6 +104,12 @@ func providerReasoningEffortError(index int) error {
 	return fmt.Errorf("providers[%d].%s", index, reasoningEffortErrorMsg)
 }
 
+// providerModelReasoningEffortError scopes the shared enum message to one
+// provider's per-model efforts.
+func providerModelReasoningEffortError(index int) error {
+	return fmt.Errorf("providers[%d].model_reasoning_effort: %s", index, reasoningEffortErrorMsg)
+}
+
 // Config is the validated runtime configuration for the proxy.
 type Config struct {
 	ListenAddress         string
@@ -122,20 +132,35 @@ type ModelRoute struct {
 }
 
 // Provider is one OpenAI-compatible inference endpoint in the routing pool.
-// A provider-level reasoning_effort overrides the global value; an explicit
-// null strips the field for this provider. Leave both zero to inherit global.
+// A model_reasoning_effort entry wins over a provider-level
+// reasoning_effort, which wins over the global value. An explicit null strips
+// the field. Leave all three unset to inherit global.
 type Provider struct {
 	Name           string
 	BaseURL        string
 	APIKey         string
 	ModelAlias     string
 	ModelAliases   map[string]string
+	Models         []string
 	Priority       int
 	HealthCheckURL string
 	BalanceURL     string
 
 	ReasoningEffort      *ReasoningEffort
 	StripReasoningEffort bool
+	ModelReasoningEffort map[string]*ReasoningEffort
+
+	// ModelLimits declares what one upstream actually accepts for one Virtual
+	// Model, keyed the same way as ModelAliases. Brokers differ here, and some
+	// report nothing, so a zero field means unknown rather than unlimited.
+	ModelLimits map[string]ModelLimit
+}
+
+// ModelLimit is one provider's declared capacity for one model. Zero means the
+// provider did not declare that dimension, so it cannot lower the route floor.
+type ModelLimit struct {
+	Context int
+	Output  int
 }
 
 type rawConfig struct {
@@ -160,12 +185,26 @@ type rawProvider struct {
 	APIKey         string            `yaml:"api_key"`
 	ModelAlias     string            `yaml:"model_alias"`
 	ModelAliases   map[string]string `yaml:"model_aliases"`
+	Models         []string          `yaml:"models"`
 	Priority       *int              `yaml:"priority"`
 	HealthCheckURL string            `yaml:"health_check_url"`
 	BalanceURL     string            `yaml:"balance_url"`
 	// ReasoningEffort keeps the raw node to distinguish absent (inherit
 	// global, zero Node) from explicit null (strip for this provider).
 	ReasoningEffort yaml.Node `yaml:"reasoning_effort"`
+	// ModelReasoningEffort maps a Virtual Model to its own effort. A YAML null
+	// value strips the field for that model, which is how a model that rejects
+	// the parameter entirely is served.
+	ModelReasoningEffort map[string]yaml.Node `yaml:"model_reasoning_effort"`
+	// ModelLimits declares per-Virtual-Model capacity, keyed like
+	// model_aliases. Field presence matters: an absent context or output means
+	// the provider did not declare it.
+	ModelLimits map[string]rawModelLimit `yaml:"model_limits"`
+}
+
+type rawModelLimit struct {
+	Context *int `yaml:"context"`
+	Output  *int `yaml:"output"`
 }
 
 type rawModelRoute struct {
@@ -353,11 +392,27 @@ func (c Config) Validate() error {
 				return fmt.Errorf("providers[%d].model_aliases must not contain empty model names or aliases", index)
 			}
 		}
+		seenModels := make(map[string]int, len(provider.Models))
+		for position, model := range provider.Models {
+			if strings.TrimSpace(model) == "" {
+				return fmt.Errorf("providers[%d].models[%d] must not be empty", index, position)
+			}
+			if previousPosition, exists := seenModels[model]; exists {
+				return fmt.Errorf("providers[%d].models[%d] duplicates providers[%d].models[%d]", index, position, index, previousPosition)
+			}
+			seenModels[model] = position
+		}
 		if provider.ReasoningEffort != nil && !provider.ReasoningEffort.IsValid() {
 			return providerReasoningEffortError(index)
 		}
 		if provider.StripReasoningEffort && provider.ReasoningEffort != nil {
 			return fmt.Errorf("providers[%d].reasoning_effort must be either null or an effort value", index)
+		}
+		if err := validateModelReasoningEffort(index, provider); err != nil {
+			return err
+		}
+		if err := validateModelLimits(index, provider); err != nil {
+			return err
 		}
 		if _, err := parseProviderBaseURL(index, provider.BaseURL); err != nil {
 			return err
@@ -373,9 +428,12 @@ func (c Config) Validate() error {
 			apiKey:       provider.APIKey,
 			modelAlias:   provider.ModelAlias,
 			modelAliases: modelAliasesIdentity(provider.ModelAliases),
+			models:       providerModelsIdentity(provider.Models),
 			priority:     provider.Priority,
 			healthURL:    provider.HealthCheckURL,
 			balanceURL:   provider.BalanceURL,
+			effort:       providerReasoningEffortIdentity(provider),
+			limits:       modelLimitsIdentity(provider.ModelLimits),
 		}
 		if _, exists := seen[definitionKey]; exists {
 			return fmt.Errorf("providers[%d] duplicates another Provider definition", index)
@@ -390,9 +448,65 @@ type providerIdentity struct {
 	apiKey       string
 	modelAlias   string
 	modelAliases string
+	models       string
 	priority     int
 	healthURL    string
 	balanceURL   string
+	effort       string
+	limits       string
+}
+
+// validateModelReasoningEffort rejects per-model efforts that no route can
+// reach: the Virtual Model must be one this Provider actually serves.
+func validateModelReasoningEffort(index int, provider Provider) error {
+	for model, effort := range provider.ModelReasoningEffort {
+		if strings.TrimSpace(model) == "" {
+			return fmt.Errorf("providers[%d].model_reasoning_effort must not contain an empty model name", index)
+		}
+		if effort != nil && !effort.IsValid() {
+			return providerModelReasoningEffortError(index)
+		}
+	}
+	return nil
+}
+
+// validateModelLimits rejects a declared capacity for a Virtual Model this
+// Provider never serves, since such an entry can never lower a route floor and
+// only hides a typo. Values are range-checked during parsing.
+func validateModelLimits(index int, provider Provider) error {
+	served := providerServedModels(provider)
+	for model, limit := range provider.ModelLimits {
+		if strings.TrimSpace(model) == "" {
+			return fmt.Errorf("providers[%d].model_limits must not contain an empty model name", index)
+		}
+		if limit.Context == 0 && limit.Output == 0 {
+			return fmt.Errorf("providers[%d].model_limits[%s] must declare context or output", index, model)
+		}
+		if len(served) > 0 {
+			if _, ok := served[model]; !ok {
+				return fmt.Errorf("providers[%d].model_limits[%s] is not a model this Provider serves", index, model)
+			}
+		}
+	}
+	return nil
+}
+
+// providerServedModels lists the Virtual Models a Provider can answer, using
+// the same rule as ModelAliasFor: the alias keys in multi-model mode, and the
+// implicit "gonka" route in legacy mode.
+func providerServedModels(provider Provider) map[string]struct{} {
+	var served map[string]struct{}
+	if len(provider.ModelAliases) > 0 {
+		served = make(map[string]struct{}, len(provider.ModelAliases))
+		for model := range provider.ModelAliases {
+			served[model] = struct{}{}
+		}
+		return served
+	}
+	if _, ok := provider.ModelAliasFor(LegacyVirtualModel); ok {
+		return map[string]struct{}{LegacyVirtualModel: {}}
+	}
+	return nil
 }
 
 func (c Config) validateModelRoutes() error {
@@ -521,7 +635,7 @@ func (p Provider) ModelAliasFor(model string) (string, bool) {
 		alias, ok := p.ModelAliases[model]
 		return strings.TrimSpace(alias), ok && strings.TrimSpace(alias) != ""
 	}
-	if model == "gonka" && strings.TrimSpace(p.ModelAlias) != "" {
+	if model == LegacyVirtualModel && strings.TrimSpace(p.ModelAlias) != "" {
 		return strings.TrimSpace(p.ModelAlias), true
 	}
 	return "", false
@@ -542,6 +656,57 @@ func modelAliasesIdentity(aliases map[string]string) string {
 		builder.WriteByte('=')
 		builder.WriteString(aliases[key])
 		builder.WriteByte(';')
+	}
+	return builder.String()
+}
+
+// providerReasoningEffortIdentity renders every reasoning_effort setting of one
+// provider so a config reload notices a changed per-model effort.
+func providerReasoningEffortIdentity(provider Provider) string {
+	var builder strings.Builder
+	switch {
+	case provider.StripReasoningEffort:
+		builder.WriteString("provider=null")
+	case provider.ReasoningEffort != nil:
+		builder.WriteString("provider=")
+		builder.WriteString(string(provider.ReasoningEffort.Normalize()))
+	}
+	if len(provider.ModelReasoningEffort) == 0 {
+		return builder.String()
+	}
+	keys := make([]string, 0, len(provider.ModelReasoningEffort))
+	for key := range provider.ModelReasoningEffort {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		builder.WriteString(";model=")
+		builder.WriteString(key)
+		builder.WriteByte('=')
+		if effort := provider.ModelReasoningEffort[key]; effort != nil {
+			builder.WriteString(string(effort.Normalize()))
+		} else {
+			builder.WriteString("null")
+		}
+	}
+	return builder.String()
+}
+
+// modelLimitsIdentity renders one provider's declared capacities so a config
+// reload notices a changed context or output limit.
+func modelLimitsIdentity(limits map[string]ModelLimit) string {
+	if len(limits) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(limits))
+	for key := range limits {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var builder strings.Builder
+	for _, key := range keys {
+		limit := limits[key]
+		fmt.Fprintf(&builder, ";limit=%s=%d/%d", key, limit.Context, limit.Output)
 	}
 	return builder.String()
 }
@@ -614,20 +779,92 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 		}
 	}
 
+	modelEffort, err := parseModelReasoningEffort(raw.ModelReasoningEffort)
+	if err != nil {
+		return Provider{}, providerModelReasoningEffortError(index)
+	}
+
+	modelLimits, err := parseModelLimits(index, raw.ModelLimits)
+	if err != nil {
+		return Provider{}, err
+	}
+
 	provider := Provider{
 		Name:           strings.TrimSpace(raw.Name),
 		BaseURL:        normalizedURL,
 		APIKey:         strings.TrimSpace(raw.APIKey),
 		ModelAlias:     strings.TrimSpace(raw.ModelAlias),
 		ModelAliases:   normalizeModelAliases(raw.ModelAliases),
+		Models:         normalizeModels(raw.Models),
 		Priority:       *raw.Priority,
 		HealthCheckURL: healthCheckURL,
 		BalanceURL:     balanceURL,
 
 		ReasoningEffort:      effortOverride,
 		StripReasoningEffort: stripEffort,
+		ModelReasoningEffort: modelEffort,
+		ModelLimits:          modelLimits,
 	}
 	return provider, nil
+}
+
+// parseModelLimits converts declared per-model capacities, keeping a missing
+// dimension zero so it cannot lower the route floor. A dimension is rejected
+// here rather than in Validate because only the raw pointer distinguishes an
+// omitted dimension from an explicit zero.
+func parseModelLimits(index int, raw map[string]rawModelLimit) (map[string]ModelLimit, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	parsed := make(map[string]ModelLimit, len(raw))
+	for model, limit := range raw {
+		name := strings.TrimSpace(model)
+		if name == "" {
+			return nil, fmt.Errorf("providers[%d].model_limits must not contain an empty model name", index)
+		}
+		for field, value := range map[string]*int{"context": limit.Context, "output": limit.Output} {
+			if value != nil && *value <= 0 {
+				return nil, fmt.Errorf("providers[%d].model_limits[%s].%s must be greater than zero", index, name, field)
+			}
+		}
+		parsed[name] = ModelLimit{
+			Context: positiveOrZero(limit.Context),
+			Output:  positiveOrZero(limit.Output),
+		}
+	}
+	return parsed, nil
+}
+
+func positiveOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+// parseModelReasoningEffort converts per-model effort nodes into values, where
+// a nil value means "strip the field for this model".
+func parseModelReasoningEffort(raw map[string]yaml.Node) (map[string]*ReasoningEffort, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	parsed := make(map[string]*ReasoningEffort, len(raw))
+	for model, node := range raw {
+		name := strings.TrimSpace(model)
+		switch node.Tag {
+		case "!!null":
+			parsed[name] = nil
+		case "!!str":
+			effort, err := parseReasoningEffort(node.Value)
+			if err != nil {
+				return nil, err
+			}
+			parsed[name] = effort
+		default:
+			return nil, fmt.Errorf("model %q has a non-string, non-null effort", name)
+		}
+	}
+	return parsed, nil
 }
 
 func normalizeModelAliases(raw map[string]string) map[string]string {
@@ -639,6 +876,27 @@ func normalizeModelAliases(raw map[string]string) map[string]string {
 		normalized[strings.TrimSpace(model)] = strings.TrimSpace(alias)
 	}
 	return normalized
+}
+
+// normalizeModels trims a configured upstream model list. Duplicate detection
+// happens in Validate so the error can name both positions.
+func normalizeModels(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	normalized := make([]string, 0, len(raw))
+	for _, model := range raw {
+		normalized = append(normalized, strings.TrimSpace(model))
+	}
+	return normalized
+}
+
+// providerModelsIdentity folds a model list into the duplicate-definition key.
+func providerModelsIdentity(models []string) string {
+	if len(models) == 0 {
+		return ""
+	}
+	return strings.Join(models, ";")
 }
 
 func parseOptionalProviderURL(index int, field, value string) (string, error) {

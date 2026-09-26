@@ -490,6 +490,140 @@ func TestDiagnosticsClassifyProviderFailuresWithoutSendingChatPayloads(t *testin
 	}
 }
 
+func TestDiagnosticsReportsObservedTrafficWithoutExtraUpstreamRequests(t *testing.T) {
+	var primaryPosts, backupPosts, idlePosts, primaryGets, backupGets, idleGets atomic.Int64
+
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			primaryGets.Add(1)
+			_, _ = io.WriteString(w, `{"data":[]}`)
+			return
+		}
+		primaryPosts.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"upstream boom"}`)
+	}))
+	defer primary.Close()
+
+	okUpstream := func(posts *atomic.Int64, gets *atomic.Int64) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				gets.Add(1)
+				_, _ = io.WriteString(w, `{"data":[]}`)
+				return
+			}
+			posts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"answer":"ok"}`)
+		})
+	}
+	backup := httptest.NewServer(okUpstream(&backupPosts, &backupGets))
+	defer backup.Close()
+	idle := httptest.NewServer(okUpstream(&idlePosts, &idleGets))
+	defer idle.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "primary", baseURL: primary.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{name: "backup", baseURL: backup.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+		{name: "idle", baseURL: idle.URL + "/v1", apiKey: "idle-secret", modelAlias: "idle-model", priority: 10},
+	})
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200 after failover", response.StatusCode)
+	}
+
+	postsBefore := primaryPosts.Load() + backupPosts.Load() + idlePosts.Load()
+	diagnosticsResponse, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer diagnosticsResponse.Body.Close()
+	body, err := io.ReadAll(diagnosticsResponse.Body)
+	if err != nil {
+		t.Fatalf("read diagnostics: %v", err)
+	}
+	if diagnosticsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics status = %d, want 200", diagnosticsResponse.StatusCode)
+	}
+
+	if sent := primaryPosts.Load() + backupPosts.Load() + idlePosts.Load() - postsBefore; sent != 0 {
+		t.Errorf("diagnostics sent %d chat requests, want 0", sent)
+	}
+	for name, got := range map[string]int64{"primary": primaryGets.Load(), "backup": backupGets.Load(), "idle": idleGets.Load()} {
+		if got != 1 {
+			t.Errorf("%s GET requests = %d, want 1 diagnostics probe", name, got)
+		}
+	}
+
+	var report struct {
+		Providers []struct {
+			Provider string `json:"provider"`
+			Observed struct {
+				Status            string            `json:"status"`
+				WindowHours       int               `json:"window_hours"`
+				Successes         uint64            `json:"successes"`
+				Errors            uint64            `json:"errors"`
+				ErrorCategories   map[string]uint64 `json:"error_categories"`
+				LastErrorCategory string            `json:"last_error_category"`
+			} `json:"observed"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(body, &report); err != nil {
+		t.Fatalf("decode diagnostics: %v; body=%s", err, body)
+	}
+	want := map[string]struct {
+		status    string
+		successes uint64
+		errors    uint64
+	}{
+		"primary": {"unavailable", 0, 1},
+		"backup":  {"healthy", 1, 0},
+		"idle":    {"no-data", 0, 0},
+	}
+	seen := 0
+	for _, provider := range report.Providers {
+		expected, ok := want[provider.Provider]
+		if !ok {
+			continue
+		}
+		seen++
+		observed := provider.Observed
+		if observed.Status != expected.status || observed.Successes != expected.successes || observed.Errors != expected.errors {
+			t.Errorf("observed[%q] = status=%s successes=%d errors=%d, want status=%s successes=%d errors=%d",
+				provider.Provider, observed.Status, observed.Successes, observed.Errors,
+				expected.status, expected.successes, expected.errors)
+		}
+		if observed.WindowHours <= 0 {
+			t.Errorf("observed[%q].window_hours = %d, want a positive window", provider.Provider, observed.WindowHours)
+		}
+		if provider.Provider == "primary" {
+			var total uint64
+			for _, count := range observed.ErrorCategories {
+				total += count
+			}
+			if total != observed.Errors || observed.LastErrorCategory == "" {
+				t.Errorf("observed[primary] categories=%v last=%q, want one category covering %d errors",
+					observed.ErrorCategories, observed.LastErrorCategory, observed.Errors)
+			}
+		}
+	}
+	if seen != len(want) {
+		t.Fatalf("diagnostics reported %d watched providers, want %d; body=%s", seen, len(want), body)
+	}
+	for _, secret := range []string{"primary-secret", "backup-secret", "idle-secret", "primary-model", "upstream boom"} {
+		if strings.Contains(string(body), secret) {
+			t.Errorf("diagnostics leaked %q: %s", secret, body)
+		}
+	}
+}
+
 func TestDiagnosticsUsesConfiguredBalanceCapability(t *testing.T) {
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/balance" {
@@ -1176,6 +1310,291 @@ func TestInitialVirtualModelsRouteEndToEnd(t *testing.T) {
 	defer unknown.Body.Close()
 	if unknown.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
+	}
+}
+
+func TestModelsPublishesFloorAcrossRouteProviders(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "wide", BaseURL: "https://wide.example/v1", APIKey: "wide-secret", Priority: 100,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds", "minimax-m2.7": "mm"},
+				ModelLimits:  map[string]config.ModelLimit{"deepseek-v4-flash-0731": {Context: 400000, Output: 16384}},
+			},
+			{
+				Name: "narrow", BaseURL: "https://narrow.example/v1", APIKey: "narrow-secret", Priority: 50,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds-narrow", "minimax-m2.7": "mm-narrow"},
+				ModelLimits: map[string]config.ModelLimit{
+					"deepseek-v4-flash-0731": {Context: 200000, Output: 8192},
+					"minimax-m2.7":           {Context: 180000},
+				},
+			},
+			{
+				Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds-silent", "minimax-m2.7": "mm-silent"},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"deepseek-v4-flash-0731": {},
+			"minimax-m2.7":           {},
+		},
+		ModelRouteOrder: []string{"deepseek-v4-flash-0731", "minimax-m2.7"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		// the floor comes from narrow, the smallest declared value in the route
+		"deepseek-v4-flash-0731": {Context: 200000, Output: 8192, ContextSet: true, OutputSet: true},
+		// narrow declares context only, so output stays unknown rather than 0
+		"minimax-m2.7": {Context: 180000, ContextSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+func TestModelsOmitsLimitsWhenNoProviderDeclaresThem(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+			ModelAliases: map[string]string{"gonka": "ds"},
+		}},
+		ModelRoutes:     map[string]config.ModelRoute{"gonka": {}},
+		ModelRouteOrder: []string{"gonka"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	if got, ok := limits["gonka"]; ok {
+		t.Fatalf("published limits = %+v, want no entry for an undeclared model", got)
+	}
+}
+
+func TestModelsLimitsIgnoreProvidersOutsideTheRoute(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "member", BaseURL: "https://member.example/v1", APIKey: "member-secret", Priority: 100,
+				ModelAliases: map[string]string{"glm-5.3-flash": "glm-member"},
+				ModelLimits:  map[string]config.ModelLimit{"glm-5.3-flash": {Context: 400000, Output: 16384}},
+			},
+			{
+				// serves the same Virtual Model but is not in this route, so its
+				// smaller limit must not lower the published floor
+				Name: "outsider", BaseURL: "https://outsider.example/v1", APIKey: "outsider-secret", Priority: 50,
+				ModelAliases: map[string]string{"glm-5.3-flash": "glm-outsider"},
+				ModelLimits:  map[string]config.ModelLimit{"glm-5.3-flash": {Context: 1000, Output: 1}},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"glm-5.3-flash": {Providers: []string{"member"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		"glm-5.3-flash": {Context: 400000, Output: 16384, ContextSet: true, OutputSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+func TestModelsLimitsUseLegacyProviderModel(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "legacy", BaseURL: "https://legacy.example/v1", APIKey: "legacy-secret", Priority: 10,
+			ModelAlias:  "upstream-model",
+			ModelLimits: map[string]config.ModelLimit{"gonka": {Context: 120000, Output: 4096}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		"gonka": {Context: 120000, Output: 4096, ContextSet: true, OutputSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+type publishedLimit struct {
+	Context    int
+	Output     int
+	ContextSet bool
+	OutputSet  bool
+}
+
+// fetchModelLimits reads /v1/models and reports the limit fields per model,
+// separating an absent field from a zero one.
+func fetchModelLimits(t *testing.T, baseURL string) map[string]publishedLimit {
+	t.Helper()
+	response, err := http.Get(baseURL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	var body struct {
+		Data []struct {
+			ID             string `json:"id"`
+			ContextLength  *int   `json:"context_length"`
+			ContextWindow  *int   `json:"context_window"`
+			MaxOutputToken *int   `json:"max_output_tokens"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	limits := make(map[string]publishedLimit, len(body.Data))
+	for _, entry := range body.Data {
+		limit := publishedLimit{}
+		if entry.ContextLength != nil {
+			limit.Context, limit.ContextSet = *entry.ContextLength, true
+		}
+		if entry.ContextWindow != nil {
+			if limit.ContextSet && limit.Context != *entry.ContextWindow {
+				t.Errorf("%s context_length %d disagrees with context_window %d", entry.ID, limit.Context, *entry.ContextWindow)
+			}
+			limit.Context, limit.ContextSet = *entry.ContextWindow, true
+		}
+		if entry.MaxOutputToken != nil {
+			limit.Output, limit.OutputSet = *entry.MaxOutputToken, true
+		}
+		if limit.ContextSet || limit.OutputSet {
+			limits[entry.ID] = limit
+		}
+	}
+	return limits
+}
+
+func TestDiagnosticsReportsUndeclaredModelLimitProviders(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		HealthHistoryPath:     filepath.Join(t.TempDir(), "health-history.json"),
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "declared", BaseURL: "https://declared.example/v1", APIKey: "declared-secret", Priority: 100,
+				ModelAliases: map[string]string{"gonka": "ds", "glm-5.3-flash": "glm"},
+				ModelLimits: map[string]config.ModelLimit{
+					"gonka":         {Context: 200000, Output: 8192},
+					"glm-5.3-flash": {Context: 400000, Output: 16384},
+				},
+			},
+			{
+				// declares a context window but stays silent about generation,
+				// which must be reported per dimension
+				Name: "context-only", BaseURL: "https://context.example/v1", APIKey: "context-secret", Priority: 50,
+				ModelAliases: map[string]string{"gonka": "ds-context"},
+				ModelLimits:  map[string]config.ModelLimit{"gonka": {Context: 380000}},
+			},
+			{
+				Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+				ModelAliases: map[string]string{"gonka": "ds-silent", "glm-5.3-flash": "glm-silent"},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":         {},
+			"glm-5.3-flash": {Providers: []string{"declared"}},
+		},
+		ModelRouteOrder: []string{"gonka", "glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer response.Body.Close()
+	var body struct {
+		ModelLimits []struct {
+			Model           string   `json:"model"`
+			ContextLength   int      `json:"context_length"`
+			MaxOutputTokens int      `json:"max_output_tokens"`
+			ContextUnknown  []string `json:"context_unknown_providers"`
+			OutputUnknown   []string `json:"output_unknown_providers"`
+			Remediation     string   `json:"remediation"`
+		} `json:"model_limits"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode diagnostics: %v", err)
+	}
+	if len(body.ModelLimits) != 2 {
+		t.Fatalf("model_limits = %d entries, want 2: %+v", len(body.ModelLimits), body.ModelLimits)
+	}
+	if body.ModelLimits[0].Model != "gonka" {
+		t.Fatalf("first model = %q, want gonka in route order", body.ModelLimits[0].Model)
+	}
+	if body.ModelLimits[0].ContextLength != 200000 || body.ModelLimits[0].MaxOutputTokens != 8192 {
+		t.Errorf("gonka limits = %d/%d, want 200000/8192", body.ModelLimits[0].ContextLength, body.ModelLimits[0].MaxOutputTokens)
+	}
+	if !reflect.DeepEqual(body.ModelLimits[0].ContextUnknown, []string{"silent"}) {
+		t.Errorf("gonka context_unknown = %v, want [silent]", body.ModelLimits[0].ContextUnknown)
+	}
+	if !reflect.DeepEqual(body.ModelLimits[0].OutputUnknown, []string{"context-only", "silent"}) {
+		t.Errorf("gonka output_unknown = %v, want [context-only silent]", body.ModelLimits[0].OutputUnknown)
+	}
+	if body.ModelLimits[0].Remediation == "" {
+		t.Error("gonka remediation is empty, want a hint about the silent providers")
+	}
+	if len(body.ModelLimits[1].ContextUnknown) != 0 || len(body.ModelLimits[1].OutputUnknown) != 0 {
+		t.Errorf("glm-5.3-flash unknown = %v/%v, want none because its route lists only the declared provider",
+			body.ModelLimits[1].ContextUnknown, body.ModelLimits[1].OutputUnknown)
+	}
+	if body.ModelLimits[1].Remediation != "" {
+		t.Errorf("glm-5.3-flash remediation = %q, want empty", body.ModelLimits[1].Remediation)
 	}
 }
 
@@ -3373,6 +3792,211 @@ func TestChatCompletionsAppliesPerProviderReasoningEffort(t *testing.T) {
 				t.Fatal("timed out waiting for upstream observation")
 			}
 		})
+	}
+}
+
+func TestChatCompletionsAppliesPerModelReasoningEffort(t *testing.T) {
+	high := config.ReasoningEffortHigh
+	low := config.ReasoningEffortLow
+	tests := []struct {
+		name           string
+		globalEffort   *config.ReasoningEffort
+		providerEffort *config.ReasoningEffort
+		perModel       map[string]*config.ReasoningEffort
+		clientModel    string
+		wantEffort     *string
+	}{
+		{
+			name:         "model without an entry keeps the global value",
+			globalEffort: effortPtr(config.ReasoningEffortMax),
+			perModel:     map[string]*config.ReasoningEffort{"strict-model": &low},
+			clientModel:  "virtual-model",
+			wantEffort:   stringPtr("max"),
+		},
+		{
+			name:         "per-model value wins over global",
+			globalEffort: effortPtr(config.ReasoningEffortMax),
+			perModel:     map[string]*config.ReasoningEffort{"virtual-model": &low},
+			clientModel:  "virtual-model",
+			wantEffort:   stringPtr("low"),
+		},
+		{
+			name:           "per-model value wins over the provider value",
+			globalEffort:   effortPtr(config.ReasoningEffortMax),
+			providerEffort: &high,
+			perModel:       map[string]*config.ReasoningEffort{"virtual-model": &low},
+			clientModel:    "virtual-model",
+			wantEffort:     stringPtr("low"),
+		},
+		{
+			name:         "null per-model entry strips the field",
+			globalEffort: effortPtr(config.ReasoningEffortHigh),
+			perModel:     map[string]*config.ReasoningEffort{"virtual-model": nil},
+			clientModel:  "virtual-model",
+			wantEffort:   nil,
+		},
+		{
+			name:         "null per-model entry strips a client-supplied value",
+			globalEffort: effortPtr(config.ReasoningEffortHigh),
+			perModel:     map[string]*config.ReasoningEffort{"virtual-model": nil},
+			clientModel:  "virtual-model",
+			wantEffort:   nil,
+		},
+		{
+			name:         "per-model entry is scoped to its own model",
+			globalEffort: effortPtr(config.ReasoningEffortHigh),
+			perModel:     map[string]*config.ReasoningEffort{"other-model": &low},
+			clientModel:  "virtual-model",
+			wantEffort:   stringPtr("high"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := make(chan upstreamObservation, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read upstream body: %v", err)
+					return
+				}
+				observation <- upstreamObservation{body: body}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"ok":true}`)
+			}))
+			defer upstream.Close()
+
+			handler, err := proxy.NewWithLogger(config.Config{
+				ListenAddress:         "127.0.0.1:8080",
+				Cooldown:              time.Second,
+				RecoveryWait:          time.Second,
+				ResponseHeaderTimeout: time.Second,
+				ReasoningEffort:       tc.globalEffort,
+				Providers: []config.Provider{
+					{
+						Name:     "primary",
+						BaseURL:  upstream.URL + "/v1",
+						APIKey:   "provider-secret",
+						Priority: 10,
+						ModelAliases: map[string]string{
+							"virtual-model": "provider-model",
+							"other-model":   "other-upstream",
+						},
+						ReasoningEffort:      tc.providerEffort,
+						ModelReasoningEffort: tc.perModel,
+					},
+				},
+				ModelRoutes: map[string]config.ModelRoute{
+					"virtual-model": {Providers: []string{"primary"}},
+					"other-model":   {Providers: []string{"primary"}},
+				},
+				ModelRouteOrder: []string{"virtual-model", "other-model"},
+			}, log.New(io.Discard, "", 0))
+			if err != nil {
+				t.Fatalf("create proxy: %v", err)
+			}
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"`+tc.clientModel+`","reasoning_effort":"low","messages":[]}`))
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+			_, _ = io.ReadAll(resp.Body)
+
+			select {
+			case obs := <-observation:
+				assertRequestBody(t, obs.body, `{"model":"`+tc.clientModel+`","reasoning_effort":"low","messages":[]}`, "provider-model", tc.wantEffort)
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for upstream observation")
+			}
+		})
+	}
+}
+
+func TestChatCompletionsAppliesPerModelReasoningEffortPerProvider(t *testing.T) {
+	// Two providers serve the same Virtual Model with different effort
+	// requirements, so failover must re-resolve the effort per provider.
+	type observation struct {
+		provider string
+		effort   string
+	}
+	seen := make(chan observation, 2)
+	newUpstream := func(name string, status int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read upstream body: %v", err)
+				return
+			}
+			var payload struct {
+				Effort string `json:"reasoning_effort"`
+			}
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Errorf("decode upstream body: %v", err)
+			}
+			seen <- observation{provider: name, effort: payload.Effort}
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"error":"boom"}`)
+		}))
+	}
+	primary := newUpstream("primary", http.StatusInternalServerError)
+	defer primary.Close()
+	backup := newUpstream("backup", http.StatusOK)
+	defer backup.Close()
+
+	low := config.ReasoningEffortLow
+	high := config.ReasoningEffortHigh
+	handler, err := proxy.NewWithLogger(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       effortPtr(config.ReasoningEffortMax),
+		Providers: []config.Provider{
+			{
+				Name: "primary", BaseURL: primary.URL + "/v1", APIKey: "primary-secret",
+				Priority:             100,
+				ModelAliases:         map[string]string{"virtual-model": "provider-model"},
+				ModelReasoningEffort: map[string]*config.ReasoningEffort{"virtual-model": &low},
+			},
+			{
+				Name: "backup", BaseURL: backup.URL + "/v1", APIKey: "backup-secret",
+				Priority:             50,
+				ModelAliases:         map[string]string{"virtual-model": "provider-model"},
+				ModelReasoningEffort: map[string]*config.ReasoningEffort{"virtual-model": &high},
+			},
+		},
+		ModelRoutes:     map[string]config.ModelRoute{"virtual-model": {Providers: []string{"primary", "backup"}}},
+		ModelRouteOrder: []string{"virtual-model"},
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	got := make(map[string]string, 2)
+	for range 2 {
+		select {
+		case obs := <-seen:
+			got[obs.provider] = obs.effort
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for upstream observations")
+		}
+	}
+	if got["primary"] != "low" || got["backup"] != "high" {
+		t.Errorf("upstream efforts = %v, want primary=low backup=high", got)
 	}
 }
 

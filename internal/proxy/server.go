@@ -45,6 +45,7 @@ type Server struct {
 	routes           map[string][]*provider
 	fallbacks        map[string]string
 	modelOrder       []string
+	modelLimits      map[string]modelLimit
 	legacyModelMode  bool
 	fallbackMode     bool
 	client           *http.Client
@@ -152,12 +153,14 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 			fallbacks[routeName] = fallback
 		}
 	}
+	modelLimits := resolveModelLimits(routes)
 
 	server := &Server{
 		providers:        providers,
 		routes:           routes,
 		fallbacks:        fallbacks,
 		modelOrder:       modelOrder,
+		modelLimits:      modelLimits,
 		legacyModelMode:  len(cfg.ModelRoutes) == 0,
 		fallbackMode:     len(cfg.ModelRoutes) > 0,
 		cooldownDuration: cfg.Cooldown,
@@ -196,6 +199,21 @@ func resolveReasoningEffort(global *config.ReasoningEffort, p config.Provider) *
 		return override
 	}
 	return global
+}
+
+// resolveReasoningEffortForModel refines the provider-wide effort for one
+// Virtual Model. Brokers validate reasoning_effort per model, so a pool can
+// serve a reasoning model and a strict one from the same endpoint. A
+// per-model entry wins, including a nil entry that strips the field. A model
+// without an entry keeps the provider-wide value.
+func resolveReasoningEffortForModel(providerEffort *config.ReasoningEffort, perModel map[string]*config.ReasoningEffort, model string) *config.ReasoningEffort {
+	if effort, ok := perModel[model]; ok {
+		if effort == nil {
+			return nil
+		}
+		return normalizeReasoningEffort(effort)
+	}
+	return providerEffort
 }
 
 // ServeHTTP handles the chat completion and operational metrics endpoints.
@@ -287,6 +305,47 @@ type modelEntry struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
+	// context_length carries the OpenRouter-style name and context_window the
+	// name half the Gonka brokers use; both hold the same floor. Both are
+	// omitted when no provider in the route declares that dimension.
+	ContextLength   *int `json:"context_length,omitempty"`
+	ContextWindow   *int `json:"context_window,omitempty"`
+	MaxOutputTokens *int `json:"max_output_tokens,omitempty"`
+}
+
+// modelLimit is the capacity a whole route can be relied on for: the smallest
+// declared value among the providers that serve it. A zero dimension means no
+// provider declared it, so it stays unpublished instead of claiming zero.
+type modelLimit struct {
+	context int
+	output  int
+}
+
+// resolveModelLimits lowers each route's declared capacities to the smallest
+// value among the providers that actually serve it, since failover can land on
+// any of them. A provider that declares nothing for a model cannot lower the
+// floor, which is why that gap is reported in /diagnostics rather than here.
+func resolveModelLimits(routes map[string][]*provider) map[string]modelLimit {
+	limits := make(map[string]modelLimit, len(routes))
+	for routeName, routeProviders := range routes {
+		var limit modelLimit
+		for _, routeProvider := range routeProviders {
+			declared, ok := routeProvider.ModelLimits[routeName]
+			if !ok {
+				continue
+			}
+			if declared.Context > 0 && (limit.context == 0 || declared.Context < limit.context) {
+				limit.context = declared.Context
+			}
+			if declared.Output > 0 && (limit.output == 0 || declared.Output < limit.output) {
+				limit.output = declared.Output
+			}
+		}
+		if limit.context > 0 || limit.output > 0 {
+			limits[routeName] = limit
+		}
+	}
+	return limits
 }
 
 func (s *Server) serveModels(w http.ResponseWriter) error {
@@ -298,12 +357,22 @@ func (s *Server) serveModels(w http.ResponseWriter) error {
 		if _, exists := s.routes[model]; !exists {
 			continue
 		}
-		response.Data = append(response.Data, modelEntry{
+		entry := modelEntry{
 			ID:      model,
 			Object:  "model",
 			Created: 0,
 			OwnedBy: "gonka-proxy",
-		})
+		}
+		if limit, exists := s.modelLimits[model]; exists {
+			if limit.context > 0 {
+				entry.ContextLength = &limit.context
+				entry.ContextWindow = &limit.context
+			}
+			if limit.output > 0 {
+				entry.MaxOutputTokens = &limit.output
+			}
+		}
+		response.Data = append(response.Data, entry)
 	}
 	return json.NewEncoder(w).Encode(response)
 }
@@ -372,7 +441,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				if !ok {
 					continue
 				}
-				upstreamBody, err := applyUpstreamOverrides(payload, modelAlias, selected.reasoningEffort)
+				upstreamBody, err := applyUpstreamOverrides(payload, modelAlias, resolveReasoningEffortForModel(selected.reasoningEffort, selected.ModelReasoningEffort, routeName))
 				if err != nil {
 					http.Error(w, "could not encode upstream request", http.StatusBadGateway)
 					return

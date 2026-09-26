@@ -73,6 +73,75 @@ model_routes:
 	}
 }
 
+func TestLoadParsesProviderModels(t *testing.T) {
+	cfg := loadConfig(t, `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    models:
+      - deepseek-ai/DeepSeek-V4-Flash-0731
+      - " MiniMaxAI/MiniMax-M2.7 "
+    priority: 10
+`)
+
+	models := cfg.Providers[0].Models
+	if len(models) != 2 || models[0] != "deepseek-ai/DeepSeek-V4-Flash-0731" || models[1] != "MiniMaxAI/MiniMax-M2.7" {
+		t.Fatalf("models = %#v, want trimmed list in configured order", models)
+	}
+}
+
+func TestLoadRejectsInvalidProviderModels(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "empty entry",
+			body: `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    models: [" "]
+    priority: 10
+`,
+			want: "providers[0].models[0] must not be empty",
+		},
+		{
+			name: "duplicate entry",
+			body: `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    models: [same, " same "]
+    priority: 10
+`,
+			want: "providers[0].models[1] duplicates providers[0].models[0]",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatal("Load succeeded for an invalid models list")
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %q, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalidModelRoutes(t *testing.T) {
 	tests := []struct {
 		name string
@@ -716,6 +785,112 @@ func TestLoadProviderReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestLoadModelReasoningEffort(t *testing.T) {
+	template := func(effortBlock string) string {
+		return "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_aliases:\n      virtual-model: provider-model\n      strict-model: strict-upstream\n    priority: 10\n" + effortBlock + "model_routes:\n  virtual-model: {}\n  strict-model: {}\n"
+	}
+	tests := []struct {
+		name        string
+		effortBlock string
+		want        map[string]*string // nil value means "strip for this model"
+		wantErr     string
+	}{
+		{
+			name:        "absent leaves every model on the provider value",
+			effortBlock: "",
+		},
+		{
+			name:        "value per model",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: low\n",
+			want:        map[string]*string{"strict-model": stringPtr("low")},
+		},
+		{
+			name:        "null strips the field for that model",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: null\n",
+			want:        map[string]*string{"strict-model": nil},
+		},
+		{
+			name:        "tilde strips the field for that model",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: ~\n",
+			want:        map[string]*string{"strict-model": nil},
+		},
+		{
+			name:        "mixed values and strips",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: ~\n      virtual-model: medium\n",
+			want:        map[string]*string{"strict-model": nil, "virtual-model": stringPtr("medium")},
+		},
+		{
+			name:        "uppercase normalized",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: HIGH\n",
+			want:        map[string]*string{"strict-model": stringPtr("high")},
+		},
+		{
+			name:        "empty map is allowed",
+			effortBlock: "    model_reasoning_effort: {}\n",
+		},
+		{
+			name:        "quoted null is an error",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: \"null\"\n",
+			wantErr:     "providers[0].model_reasoning_effort: reasoning_effort must be one of",
+		},
+		{
+			name:        "unknown effort is an error",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: extreme\n",
+			wantErr:     "providers[0].model_reasoning_effort: reasoning_effort must be one of",
+		},
+		{
+			name:        "numeric is an error",
+			effortBlock: "    model_reasoning_effort:\n      strict-model: 123\n",
+			wantErr:     "providers[0].model_reasoning_effort: reasoning_effort must be one of",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(template(test.effortBlock)), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := config.Load(configPath)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Load succeeded, want error containing %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %q, want substring %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			provider := cfg.Providers[0]
+			if len(provider.ModelReasoningEffort) != len(test.want) {
+				t.Fatalf("ModelReasoningEffort = %#v, want %d entries", provider.ModelReasoningEffort, len(test.want))
+			}
+			for model, want := range test.want {
+				got, ok := provider.ModelReasoningEffort[model]
+				if !ok {
+					t.Errorf("ModelReasoningEffort[%q] missing", model)
+					continue
+				}
+				if want == nil {
+					if got != nil {
+						t.Errorf("ModelReasoningEffort[%q] = %q, want strip (nil)", model, *got)
+					}
+					continue
+				}
+				if got == nil {
+					t.Errorf("ModelReasoningEffort[%q] = nil, want %q", model, *want)
+					continue
+				}
+				if string(*got) != *want {
+					t.Errorf("ModelReasoningEffort[%q] = %q, want %q", model, *got, *want)
+				}
+			}
+		})
+	}
+}
+
 func TestLoadProviderReasoningEffortErrorIndex(t *testing.T) {
 	contents := "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: provider-model\n    priority: 10\n  - name: backup\n    base_url: https://backup.example/v1\n    api_key: backup-secret\n    model_alias: backup-model\n    priority: 5\n    reasoning_effort: extreme\n"
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -783,6 +958,133 @@ func TestValidateReasoningEffortCaseInsensitive(t *testing.T) {
 		t.Fatal("Validate with extreme should fail")
 	} else if !strings.Contains(err.Error(), "null") {
 		t.Fatalf("error = %q, want to contain null", err)
+	}
+}
+
+func TestLoadModelLimits(t *testing.T) {
+	template := func(limitsBlock string) string {
+		return "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_aliases:\n      virtual-model: provider-model\n    priority: 10\n" + limitsBlock + "model_routes:\n  virtual-model: {}\n"
+	}
+	tests := []struct {
+		name        string
+		limitsBlock string
+		want        map[string]config.ModelLimit
+		wantErr     string
+	}{
+		{
+			name:        "absent leaves every model unknown",
+			limitsBlock: "",
+		},
+		{
+			name:        "context and output per model",
+			limitsBlock: "    model_limits:\n      virtual-model: {context: 200000, output: 8192}\n",
+			want:        map[string]config.ModelLimit{"virtual-model": {Context: 200000, Output: 8192}},
+		},
+		{
+			name:        "context only leaves output unknown",
+			limitsBlock: "    model_limits:\n      virtual-model: {context: 200000}\n",
+			want:        map[string]config.ModelLimit{"virtual-model": {Context: 200000}},
+		},
+		{
+			name:        "output only leaves context unknown",
+			limitsBlock: "    model_limits:\n      virtual-model: {output: 8192}\n",
+			want:        map[string]config.ModelLimit{"virtual-model": {Output: 8192}},
+		},
+		{
+			name:        "block style is accepted",
+			limitsBlock: "    model_limits:\n      virtual-model:\n        context: 200000\n        output: 8192\n",
+			want:        map[string]config.ModelLimit{"virtual-model": {Context: 200000, Output: 8192}},
+		},
+		{
+			name:        "empty map is allowed",
+			limitsBlock: "    model_limits: {}\n",
+		},
+		{
+			name:        "zero context is an error",
+			limitsBlock: "    model_limits:\n      virtual-model: {context: 0}\n",
+			wantErr:     "providers[0].model_limits[virtual-model].context must be greater than zero",
+		},
+		{
+			name:        "negative output is an error",
+			limitsBlock: "    model_limits:\n      virtual-model: {output: -1}\n",
+			wantErr:     "providers[0].model_limits[virtual-model].output must be greater than zero",
+		},
+		{
+			name:        "empty model name is an error",
+			limitsBlock: "    model_limits:\n      \"\": {context: 200000}\n",
+			wantErr:     "providers[0].model_limits must not contain an empty model name",
+		},
+		{
+			name:        "limit for a model the provider does not serve is an error",
+			limitsBlock: "    model_limits:\n      other-model: {context: 200000}\n",
+			wantErr:     "providers[0].model_limits[other-model] is not a model this Provider serves",
+		},
+		{
+			name:        "unknown limit field is an error",
+			limitsBlock: "    model_limits:\n      virtual-model: {ctx: 200000}\n",
+			wantErr:     "field ctx not found",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(template(test.limitsBlock)), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := config.Load(configPath)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Load succeeded, want error containing %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %q, want substring %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			provider := cfg.Providers[0]
+			if len(provider.ModelLimits) != len(test.want) {
+				t.Fatalf("ModelLimits = %#v, want %d entries", provider.ModelLimits, len(test.want))
+			}
+			for model, want := range test.want {
+				got, ok := provider.ModelLimits[model]
+				if !ok {
+					t.Errorf("ModelLimits[%q] missing", model)
+					continue
+				}
+				if got != want {
+					t.Errorf("ModelLimits[%q] = %+v, want %+v", model, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadModelLimitsWithoutModelAliases(t *testing.T) {
+	// A legacy provider serves only the implicit "gonka" Virtual Model, so that
+	// is the key its per-model settings use.
+	contents := "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: legacy-model\n    priority: 10\n    model_limits:\n      gonka: {context: 100000, output: 4096}\n"
+	cfg := loadConfig(t, contents)
+	want := config.ModelLimit{Context: 100000, Output: 4096}
+	if got := cfg.Providers[0].ModelLimits["gonka"]; got != want {
+		t.Fatalf("ModelLimits[gonka] = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadModelLimitsRejectsLegacyUpstreamModelName(t *testing.T) {
+	contents := "reasoning_effort: max\nproviders:\n  - name: primary\n    base_url: https://provider.example/v1\n    api_key: provider-secret\n    model_alias: legacy-model\n    priority: 10\n    model_limits:\n      legacy-model: {context: 100000}\n"
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	_, err := config.Load(configPath)
+	if err == nil {
+		t.Fatal("Load succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "providers[0].model_limits[legacy-model] is not a model this Provider serves") {
+		t.Fatalf("error = %q, want served-model error", err)
 	}
 }
 

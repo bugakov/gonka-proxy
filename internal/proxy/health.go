@@ -19,6 +19,14 @@ const (
 	healthHistoryRetention     = 30 * 24 * time.Hour
 	healthRecentLatencySamples = 20
 	healthPersistInterval      = time.Second
+
+	// healthObservationWindow bounds the real-traffic summary in
+	// /diagnostics, so an old failure does not keep a provider looking broken.
+	healthObservationWindow = 24 * time.Hour
+	// observedCategoryLimit keeps free-form upstream error reasons bounded.
+	observedCategoryLimit = 64
+	// observedCategoryLimitSeen caps distinct error categories per provider.
+	observedCategoryLimitSeen = 8
 )
 
 type healthStore struct {
@@ -237,6 +245,164 @@ func providerStatus(provider *healthProviderState, now time.Time) string {
 		return "degraded"
 	}
 	return "healthy"
+}
+
+// observedProvider is the real-traffic half of a /diagnostics report. It is
+// built only from state the proxy already recorded, so producing it never
+// contacts a provider. Times are RFC3339 strings where "" means "never".
+type observedProvider struct {
+	Status                  string            `json:"status"`
+	WindowHours             int               `json:"window_hours"`
+	WindowStart             string            `json:"window_start,omitempty"`
+	Successes               uint64            `json:"successes"`
+	Errors                  uint64            `json:"errors"`
+	ErrorCategories         map[string]uint64 `json:"error_categories,omitempty"`
+	LastSuccess             string            `json:"last_success,omitempty"`
+	LastError               string            `json:"last_error,omitempty"`
+	LastErrorCategory       string            `json:"last_error_category,omitempty"`
+	LastErrorStatus         int               `json:"last_error_status,omitempty"`
+	CooldownUntil           string            `json:"cooldown_until,omitempty"`
+	LastLatencySeconds      float64           `json:"last_latency_seconds,omitempty"`
+	AvgRecentLatencySeconds float64           `json:"avg_recent_latency_seconds,omitempty"`
+}
+
+// observedWindow holds per-provider traffic counters inside the window.
+type observedWindow struct {
+	start      time.Time
+	successes  uint64
+	errors     uint64
+	categories map[string]uint64
+}
+
+// observe summarizes recorded traffic for every provider over the trailing
+// window. It reads only local state and never contacts a provider.
+func (h *healthStore) observe(now time.Time, window time.Duration) map[string]observedProvider {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	since := now.Add(-window)
+	windows := make(map[string]*observedWindow, len(h.providers))
+	for _, event := range h.events {
+		if event.At.Before(since) {
+			continue
+		}
+		stats := windows[event.Provider]
+		if stats == nil {
+			stats = &observedWindow{categories: make(map[string]uint64)}
+			windows[event.Provider] = stats
+		}
+		if stats.start.IsZero() || event.At.Before(stats.start) {
+			stats.start = event.At
+		}
+		switch event.Type {
+		case "success":
+			stats.successes++
+		case "error":
+			stats.errors++
+			key := truncateObservedText(event.Category, observedCategoryLimit)
+			if key == "" {
+				key = "unknown"
+			}
+			stats.categories[key]++
+		}
+	}
+
+	observed := make(map[string]observedProvider, len(h.providers))
+	for name, state := range h.providers {
+		observed[name] = observedProviderFor(state, windows[name], now, int(window/time.Hour))
+	}
+	return observed
+}
+
+func observedProviderFor(state *healthProviderState, stats *observedWindow, now time.Time, windowHours int) observedProvider {
+	observed := observedProvider{
+		Status:                  observedStatus(state, stats, now),
+		WindowHours:             windowHours,
+		LastSuccess:             observedTime(state.LastSuccess),
+		LastError:               observedTime(state.LastError),
+		LastErrorCategory:       truncateObservedText(state.LastErrorCategory, observedCategoryLimit),
+		LastErrorStatus:         state.LastErrorStatus,
+		LastLatencySeconds:      state.LastLatencySeconds,
+		AvgRecentLatencySeconds: average(sliceSum(state.RecentLatencies), uint64(len(state.RecentLatencies))),
+	}
+	if state.CooldownUntil.After(now) {
+		observed.CooldownUntil = state.CooldownUntil.UTC().Format(time.RFC3339)
+	}
+	if stats != nil {
+		observed.WindowStart = stats.start.UTC().Format(time.RFC3339)
+		observed.Successes = stats.successes
+		observed.Errors = stats.errors
+		observed.ErrorCategories = topObservedCategories(stats.categories)
+	}
+	return observed
+}
+
+// observedStatus grades a provider by what the traffic in the window actually
+// did. Traffic outside the window only matters when the window itself is empty.
+func observedStatus(state *healthProviderState, stats *observedWindow, now time.Time) string {
+	if state.Successes == 0 && state.Errors == 0 {
+		return "no-data"
+	}
+	if state.CooldownUntil.After(now) {
+		if state.Successes == 0 {
+			return "unavailable"
+		}
+		return "degraded"
+	}
+	if stats != nil {
+		switch {
+		case stats.errors > 0 && stats.successes == 0:
+			return "unavailable"
+		case stats.errors > 0:
+			return "degraded"
+		case stats.successes > 0:
+			return "healthy"
+		}
+	}
+	return providerStatus(state, now)
+}
+
+// topObservedCategories returns the most frequent categories first, bounded in
+// both count and key length so one noisy upstream cannot bloat the report.
+func topObservedCategories(categories map[string]uint64) map[string]uint64 {
+	if len(categories) == 0 {
+		return nil
+	}
+	ordered := make([]string, 0, len(categories))
+	for category := range categories {
+		ordered = append(ordered, category)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if categories[ordered[i]] != categories[ordered[j]] {
+			return categories[ordered[i]] > categories[ordered[j]]
+		}
+		return ordered[i] < ordered[j]
+	})
+	if len(ordered) > observedCategoryLimitSeen {
+		ordered = ordered[:observedCategoryLimitSeen]
+	}
+	result := make(map[string]uint64, len(ordered))
+	for _, category := range ordered {
+		result[category] = categories[category]
+	}
+	return result
+}
+
+func truncateObservedText(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
+}
+
+// observedTime formats a stored timestamp for JSON, leaving it empty instead
+// of emitting a zero date.
+func observedTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
 }
 
 func (h *healthStore) load() {
