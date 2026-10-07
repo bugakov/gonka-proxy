@@ -1,29 +1,102 @@
-# Local config with real credentials (never commit)
-config.yaml
-config-*.yaml
-compose.yaml
+# ============================================================================
+# Secrets & local configuration — never commit
+# ============================================================================
 
+# Real provider credentials / local runner config (loaded at startup).
+# NOTE: config.example.yaml and smoke/config.yaml ARE tracked on purpose.
+/config.yaml
+/config-*.yaml
+
+# Per-instance local compose overrides (credentials mounted from ../config-*.yaml).
+# compose.example.yaml / compose.multi.example.yaml / compose.smoke.yaml stay tracked.
+/compose.yaml
+
+# Environment files — provider keys, tokens. Tracked .env.example stays safe.
+/.env
+/.env.*
+*.env
+!.env.example
+
+# Local runtime state that mirrors real provider metadata / health.
+/health-history.json
+/health-history*.json
+
+# ---------------------------------------------------------------------------
+# Secrets anywhere (defensive; the tracked examples are named safely above,
+# so these wildcards do not collide with them).
+# ---------------------------------------------------------------------------
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+*.csr
+*.cer
+*.der
+id_rsa
+id_ed25519
+
+# ============================================================================
+# Logs & runtime artifacts
+# ============================================================================
+
+# Live service log (currently tracked: see "Already-tracked cleanup" below).
+/gonka-proxy.log
+*.log
+
+# ============================================================================
 # Build artifacts
+# ============================================================================
+
+# Compiled proxy binary (root).
 /gonka-proxy
-bin/
-dist/
+/gonka-proxy.exe
+
+# Test binaries, coverage, fuzz corpora.
 *.test
+*.test.exe
 coverage.out
+coverage.html
+*.out
+/bin/
+/dist/
 
-# Go tooling
+# Go build cache / tooling dirs.
 vendor/
+go.work
+go.work.sum
+*.coverprofile
 
-# IDE / editor
-.idea/
-.vscode/
-*.swp
-*.swo
+# ============================================================================
+# Local tooling & scratch — never commit
+# ============================================================================
 
-# OS
-.DS_Store
-
-# Local tooling & scratch
 .agents/
 .codex/
 .codegraph/
 .scratch/
+
+# ============================================================================
+# OS / editor / diff noise
+# ============================================================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+
+# Editor temp / merge backups
+.#*#
+#*#
+
+# ============================================================================
+# Local-only copies of tracked assets (screenshots, imports, exports)
+# ============================================================================
+*.bak
+*.tmp
