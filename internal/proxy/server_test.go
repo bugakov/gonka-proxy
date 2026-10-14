@@ -56,7 +56,7 @@ func TestMetricsExposeProviderSuccessAndLatency(t *testing.T) {
 	}
 	metrics := string(metricsBody)
 	for _, expected := range []string{
-		`gonka_proxy_provider_requests_total{provider="primary",result="success"} 1`,
+		`gonka_proxy_provider_requests_total{provider="primary",endpoint="chat/completions",result="success"} 1`,
 		`gonka_proxy_provider_upstream_responses_total{category="success",provider="primary",status="200"} 1`,
 		`gonka_proxy_provider_request_duration_seconds_count{provider="primary"} 1`,
 	} {
@@ -4254,6 +4254,495 @@ func TestChatCompletionsFailoverUsesEachProvidersReasoningEffort(t *testing.T) {
 		assertRequestBody(t, obs.body, requestBody, "backup-model", stringPtr("high"))
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for backup upstream observation")
+	}
+}
+
+func TestResponsesProxiesToUpstreamResponsesEndpoint(t *testing.T) {
+	observed := make(chan upstreamObservation, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+			return
+		}
+		observed <- upstreamObservation{authorization: r.Header.Get("Authorization"), path: r.URL.Path, body: body}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output":["hello"]}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "primary", baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"virtual-model","input":"hello"}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != `{"output":["hello"]}` {
+		t.Fatalf("response body = %s, want upstream responses body", body)
+	}
+
+	select {
+	case obs := <-observed:
+		if obs.path != "/v1/responses" {
+			t.Errorf("upstream path = %q, want /v1/responses", obs.path)
+		}
+		if obs.authorization != "Bearer provider-secret" {
+			t.Errorf("upstream authorization = %q, want Bearer provider-secret", obs.authorization)
+		}
+		assertRequestBody(t, obs.body, `{"model":"virtual-model","input":"hello"}`, "provider-model", stringPtr("max"))
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream observation")
+	}
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, _ := io.ReadAll(metricsResponse.Body)
+	for _, expected := range []string{
+		`gonka_proxy_provider_requests_total{provider="primary",endpoint="responses",result="success"} 1`,
+	} {
+		if !strings.Contains(string(metricsBody), expected) {
+			t.Errorf("metrics = %q, want %q", metricsBody, expected)
+		}
+	}
+}
+
+func TestResponsesFailsOverOnRateLimitAndUsesResponsesEndpoint(t *testing.T) {
+	var rateLimitedHits atomic.Int32
+	var backupHits atomic.Int32
+	rateLimitedPaths := make(chan string, 1)
+	backupPaths := make(chan string, 1)
+
+	rateLimitedProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rateLimitedHits.Add(1)
+		rateLimitedPaths <- r.URL.Path
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer rateLimitedProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		backupPaths <- r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServer(t, []providerFixture{
+		{baseURL: rateLimitedProvider.URL + "/v1", apiKey: "rate-limited-secret", modelAlias: "rate-limited-model", priority: 100},
+		{baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	})
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"virtual-model","input":"hello"}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(responseBody) != `{"provider":"backup"}` {
+		t.Fatalf("response body = %s, want backup response", responseBody)
+	}
+	if got := rateLimitedHits.Load(); got != 1 {
+		t.Fatalf("rate-limited Provider received %d requests, want 1", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+	select {
+	case path := <-rateLimitedPaths:
+		if path != "/v1/responses" {
+			t.Errorf("rate-limited upstream path = %q, want /v1/responses", path)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for rate-limited upstream path")
+	}
+	select {
+	case path := <-backupPaths:
+		if path != "/v1/responses" {
+			t.Errorf("backup upstream path = %q, want /v1/responses", path)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backup upstream path")
+	}
+}
+
+func TestResponsesMapsUnsupportedUpstreamToClearError(t *testing.T) {
+	var firstHits atomic.Int32
+	var secondHits atomic.Int32
+	firstProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer firstProvider.Close()
+	secondProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer secondProvider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Minute,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{Name: "primary", BaseURL: firstProvider.URL + "/v1", APIKey: "primary-secret", ModelAliases: map[string]string{"route-a": "model-a"}, Priority: 2},
+			{Name: "fallback", BaseURL: secondProvider.URL + "/v1", APIKey: "fallback-secret", ModelAliases: map[string]string{"route-b": "model-b"}, Priority: 1},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"route-a": {Providers: []string{"primary"}, Fallback: "route-b"},
+			"route-b": {Providers: []string{"fallback"}},
+		},
+		ModelRouteOrder: []string{"route-a", "route-b"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"route-a","input":"hello"}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	if !strings.Contains(string(body), "all Providers failed: unsupported-endpoint") {
+		t.Fatalf("body = %q, want unsupported-endpoint failure", body)
+	}
+	if got := firstHits.Load(); got != 1 {
+		t.Fatalf("primary Provider received %d requests, want 1", got)
+	}
+	if got := secondHits.Load(); got != 1 {
+		t.Fatalf("fallback Provider received %d requests, want 1", got)
+	}
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, _ := io.ReadAll(metricsResponse.Body)
+	for _, expected := range []string{
+		`gonka_proxy_provider_requests_total{provider="primary",endpoint="responses",result="error"} 1`,
+		`gonka_proxy_provider_requests_total{provider="fallback",endpoint="responses",result="error"} 1`,
+		`gonka_proxy_provider_upstream_responses_total{category="unsupported-endpoint",provider="primary",status="404"} 1`,
+		`gonka_proxy_provider_upstream_responses_total{category="unsupported-endpoint",provider="fallback",status="404"} 1`,
+		`gonka_proxy_provider_cooldowns_total{provider="primary"} 1`,
+		`gonka_proxy_provider_cooldowns_total{provider="fallback"} 1`,
+	} {
+		if !strings.Contains(string(metricsBody), expected) {
+			t.Errorf("metrics = %q, want %q", metricsBody, expected)
+		}
+	}
+}
+
+func TestResponsesLeavesClientErrorsAsRawClientErrors(t *testing.T) {
+	var providerHits atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerHits.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"bad request"}`)
+	}))
+	defer provider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{name: "primary", baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	}, time.Second, time.Second)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"virtual-model","input":"hello"}`))
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	if string(body) != `{"error":"bad request"}` {
+		t.Fatalf("body = %s, want raw upstream error body", body)
+	}
+	if got := providerHits.Load(); got != 1 {
+		t.Fatalf("Provider received %d requests, want 1 (client error does not fail over)", got)
+	}
+}
+
+func TestResponsesStreamsProviderResponsesIncrementally(t *testing.T) {
+	firstChunkWritten := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseProvider)
+		})
+	}
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Provider-Trace", "stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("streaming Provider does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"delta\":\"first\"}\n\n")
+		flusher.Flush()
+		close(firstChunkWritten)
+		<-releaseProvider
+		_, _ = io.WriteString(w, "data: {\"delta\":\"second\"}\n\ndata: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer func() {
+		release()
+		provider.Close()
+	}()
+
+	server := newProxyServer(t, []providerFixture{
+		{name: "primary", baseURL: provider.URL + "/v1", apiKey: "provider-secret", modelAlias: "provider-model", priority: 1},
+	})
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{"model":"virtual-model","input":"hello","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	proxyResponse := make(chan struct {
+		response *http.Response
+		err      error
+	}, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(req)
+		proxyResponse <- struct {
+			response *http.Response
+			err      error
+		}{response: response, err: requestErr}
+	}()
+
+	select {
+	case <-firstChunkWritten:
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("timed out waiting for streaming Provider to write its first chunk")
+	}
+
+	var response *http.Response
+	select {
+	case result := <-proxyResponse:
+		if result.err != nil {
+			t.Fatalf("proxy request: %v", result.err)
+		}
+		response = result.response
+	case <-time.After(time.Second):
+		release()
+		result := <-proxyResponse
+		if result.response != nil {
+			_ = result.response.Body.Close()
+		}
+		t.Fatalf("proxy did not expose streaming response headers promptly (request error: %v)", result.err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if got := response.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control = %q, want no-cache", got)
+	}
+	if got := response.Header.Get("X-Provider-Trace"); got != "stream" {
+		t.Fatalf("X-Provider-Trace = %q, want stream", got)
+	}
+
+	firstRead := make(chan struct {
+		body []byte
+		err  error
+	}, 1)
+	go func() {
+		buffer := make([]byte, 128)
+		count, readErr := response.Body.Read(buffer)
+		firstRead <- struct {
+			body []byte
+			err  error
+		}{body: buffer[:count], err: readErr}
+	}()
+
+	var firstChunk []byte
+	select {
+	case result := <-firstRead:
+		if result.err != nil && result.err != io.EOF {
+			t.Fatalf("read first stream chunk: %v", result.err)
+		}
+		firstChunk = append([]byte(nil), result.body...)
+	case <-time.After(time.Second):
+		release()
+		<-firstRead
+		t.Fatal("proxy buffered the first Provider stream chunk")
+	}
+
+	const expectedFirstChunk = "data: {\"delta\":\"first\"}\n\n"
+	if string(firstChunk) != expectedFirstChunk {
+		t.Fatalf("first stream chunk = %q, want %q", firstChunk, expectedFirstChunk)
+	}
+
+	release()
+	rest, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read remaining stream: %v", err)
+	}
+	gotBody := append(firstChunk, rest...)
+	wantBody := expectedFirstChunk + "data: {\"delta\":\"second\"}\n\ndata: [DONE]\n\n"
+	if string(gotBody) != wantBody {
+		t.Fatalf("stream body = %q, want %q", gotBody, wantBody)
+	}
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, _ := io.ReadAll(metricsResponse.Body)
+	for _, expected := range []string{
+		`gonka_proxy_provider_requests_total{provider="primary",endpoint="responses",result="success"} 1`,
+	} {
+		if !strings.Contains(string(metricsBody), expected) {
+			t.Errorf("metrics = %q, want %q", metricsBody, expected)
+		}
+	}
+}
+
+func TestResponsesMarksInterruptedStreamCooldownWithoutFailover(t *testing.T) {
+	var primaryHits atomic.Int32
+	var backupHits atomic.Int32
+	var primaryPath string
+	const interruptedChunk = "data: {\"provider\":\"primary\"}\n\n"
+
+	primaryProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		primaryPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "100")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("streaming Provider does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, interruptedChunk)
+		flusher.Flush()
+		// The declared length exceeds the bytes sent to simulate an interrupted generation.
+	}))
+	defer primaryProvider.Close()
+
+	backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"provider":"backup"}`)
+	}))
+	defer backupProvider.Close()
+
+	server := newProxyServerWithTiming(t, []providerFixture{
+		{name: "primary", baseURL: primaryProvider.URL + "/v1", apiKey: "primary-secret", modelAlias: "primary-model", priority: 100},
+		{name: "backup", baseURL: backupProvider.URL + "/v1", apiKey: "backup-secret", modelAlias: "backup-model", priority: 50},
+	}, 200*time.Millisecond, time.Second)
+	defer server.Close()
+
+	firstResponse, err := http.Post(
+		server.URL+"/v1/responses",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","input":"hello","stream":true}`),
+	)
+	if err != nil {
+		t.Fatalf("first proxy request: %v", err)
+	}
+	firstBody, err := io.ReadAll(firstResponse.Body)
+	_ = firstResponse.Body.Close()
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("read interrupted stream: %v", err)
+	}
+	if firstResponse.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", firstResponse.StatusCode, http.StatusOK)
+	}
+	if string(firstBody) != interruptedChunk {
+		t.Fatalf("first body = %q, want %q", firstBody, interruptedChunk)
+	}
+	if primaryPath != "/v1/responses" {
+		t.Errorf("primary upstream path = %q, want /v1/responses", primaryPath)
+	}
+	if got := backupHits.Load(); got != 0 {
+		t.Fatalf("backup Provider received %d requests during interrupted stream, want 0", got)
+	}
+
+	secondResponse, err := http.Post(
+		server.URL+"/v1/responses",
+		"application/json",
+		strings.NewReader(`{"model":"virtual-model","input":"hello"}`),
+	)
+	if err != nil {
+		t.Fatalf("second proxy request: %v", err)
+	}
+	defer secondResponse.Body.Close()
+	secondBody, err := io.ReadAll(secondResponse.Body)
+	if err != nil {
+		t.Fatalf("read second response: %v", err)
+	}
+	if secondResponse.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d, want %d", secondResponse.StatusCode, http.StatusOK)
+	}
+	if string(secondBody) != `{"provider":"backup"}` {
+		t.Fatalf("second body = %s, want backup response", secondBody)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary Provider received %d requests, want 1 while cooldown is active", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup Provider received %d requests, want 1", got)
+	}
+
+	metricsResponse, err := http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	metricsBody, _ := io.ReadAll(metricsResponse.Body)
+	for _, expected := range []string{
+		`gonka_proxy_provider_stream_aborts_total{provider="primary",reason="upstream-read"} 1`,
+		`gonka_proxy_provider_requests_total{provider="primary",endpoint="responses",result="error"} 1`,
+		`gonka_proxy_provider_requests_total{provider="backup",endpoint="responses",result="success"} 1`,
+	} {
+		if !strings.Contains(string(metricsBody), expected) {
+			t.Errorf("metrics = %q, want %q", metricsBody, expected)
+		}
 	}
 }
 

@@ -40,6 +40,33 @@ jobs:
       - name: go test -race
         run: go test -race ./internal/proxy/
 
+  build-artifact:
+    name: build-artifact
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.22"
+
+      - name: Build binary
+        shell: bash
+        run: |
+          set -eu
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags='-s -w' -o gonka-proxy ./cmd/gonka-proxy
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gonka-proxy-linux-amd64
+          path: gonka-proxy
+          if-no-files-found: error
+
   smoke:
     name: smoke
     runs-on: ubuntu-24.04

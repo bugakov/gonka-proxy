@@ -7,6 +7,10 @@
 /config.yaml
 /config-*.yaml
 
+# Extra provider keys kept for reference / key rotation (dashboard exports,
+# additional accounts). Holds real third-party API keys — never commit.
+/gonka_additional_keys.txt
+
 # Per-instance local compose overrides (credentials mounted from ../config-*.yaml).
 # compose.example.yaml / compose.multi.example.yaml / compose.smoke.yaml stay tracked.
 /compose.yaml

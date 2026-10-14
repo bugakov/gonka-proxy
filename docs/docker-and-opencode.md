@@ -8,7 +8,7 @@ Copy the documented sample and replace every example Provider value:
 cp config.example.yaml config.yaml
 ```
 
-Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root, normally ending in `/v1`. The proxy appends `/chat/completions`, replaces the incoming Virtual Model with `model_alias`, and sends the Provider's `api_key` upstream.
+Each Provider has a human-readable `name`. Its `base_url` is an OpenAI API root, normally ending in `/v1`. The proxy appends `/chat/completions` (or `/responses` for Responses API calls), replaces the incoming Virtual Model with `model_alias`, and sends the Provider's `api_key` upstream.
 
 Configuration is loaded and validated once during process startup. Edit the mounted file, then restart the container to apply changes; there is no hot reload.
 
