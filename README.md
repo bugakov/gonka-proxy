@@ -429,7 +429,7 @@ Notes:
   floors match the live minimum (see [Model limits](#model-limits)).
 
 For a zero-downtime-conscious migration from scalar `model_alias` settings,
-including backup, validation, systemd restart, and rollback checks, see
+including backup, validation, restart, and rollback checks, see
 [`docs/multi-model-rollout.md`](docs/multi-model-rollout.md).
 
 ## Point your app at it
