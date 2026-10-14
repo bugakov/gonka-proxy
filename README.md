@@ -6,7 +6,7 @@ Tiny and cheap: it runs in under **10 MB of RAM** even under load, so you can ru
 
 ## What it does
 
-- Exposes **one local OpenAI-compatible endpoint** (`/v1/chat/completions`) — your app keeps talking to one URL, no matter what's happening upstream.
+- Exposes **one local OpenAI-compatible endpoint** (`/v1/chat/completions`) — your app keeps talking to one URL, no matter what's happening upstream. The Responses API (`/v1/responses`) is proxied the same way, with the same routing, failover, cooldown, redaction, and error-remapping rules.
 - Maintains a **priority-ordered pool of providers** (e.g. primary, then backups).
 - On a **402, 429, 404 (optionally) or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
 - A failed provider goes into a short **cooldown**, then comes back automatically. If every provider is down, it waits and retries until one responds or you cancel.
@@ -145,6 +145,14 @@ A provider that declares nothing cannot lower the floor, so a route with such ga
 
 Declare only what is known. A value copied from another provider's `/models` is worse than no value, because it makes the floor look trustworthy. Limits belong in the hot-reload identity, so editing one is noticed on reload.
 
+After a pool change, verify the declared floors against what the providers actually advertise. `limits-check` probes every provider's `/models` with a safe GET and compares the published floor with the live minimum — no prompts, tools, or request bodies:
+
+```sh
+go run ./cmd/limits-check -config config.yaml
+```
+
+It reports, per route, the published floor vs the live minimum and exits 1 when a fully verifiable floor does not match the live minimum or when a provider over-declares a dimension. Providers that publish no limit fields (and therefore cannot lower a floor) keep the route from being fully verifiable and are reported as `unknown` rather than failing the run.
+
 ## Metrics
 
 The proxy exposes Prometheus-compatible metrics at `GET /metrics` on the same address as the chat endpoint. Keep the listener on loopback when metrics must remain local:
@@ -155,7 +163,7 @@ curl http://127.0.0.1:58081/metrics
 
 Metrics are grouped by the configured provider name and include successful and failed provider attempts, upstream status/category, failovers, cooldown activations and skips, stream aborts, and latency histograms. The endpoint contains no request bodies, response bodies, authorization headers, or API keys. Useful signals include:
 
-- `gonka_proxy_provider_requests_total` — each request result per provider, labelled by API endpoint (`endpoint="chat/completions"`) and `result`;
+- `gonka_proxy_provider_requests_total` — each request result per provider, labelled by API endpoint (`endpoint="chat/completions"` or `endpoint="responses"`) and `result`;
 - `gonka_proxy_provider_upstream_responses_total` — upstream status and safe failure category;
 - `gonka_proxy_provider_failovers_total` and `gonka_proxy_provider_cooldowns_total` — provider failures that caused routing changes;
 - `gonka_proxy_provider_stream_aborts_total` — streams cut before the `[DONE]` marker or by a client/upstream read error;

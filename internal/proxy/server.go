@@ -20,8 +20,19 @@ import (
 )
 
 const chatCompletionsPath = "/v1/chat/completions"
+const responsesPath = "/v1/responses"
 const modelsPath = "/v1/models"
 const emptyCompletionCategory = "empty-completion"
+
+// endpoint identifies the public API surface a request arrived on or is
+// forwarded to. It feeds the per-provider requests metric label so operators
+// can tell /v1/chat/completions traffic from /v1/responses traffic.
+type endpoint string
+
+const (
+	endpointChatCompletions endpoint = "chat/completions"
+	endpointResponses       endpoint = "responses"
+)
 
 const (
 	maxLoggedErrorMessageLength = 512
@@ -64,6 +75,7 @@ type Server struct {
 type provider struct {
 	config.Provider
 	chatURL         string
+	responsesURL    string
 	cooldownUntil   time.Time
 	cooldownVersion uint64
 
@@ -96,13 +108,18 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 	providers := make([]*provider, 0, len(cfg.Providers))
 	providersByName := make(map[string]*provider, len(cfg.Providers))
 	for _, configuredProvider := range cfg.Providers {
-		chatURL, err := chatCompletionsURL(configuredProvider.BaseURL)
+		chatURL, err := endpointURL(configuredProvider.BaseURL, "chat/completions")
+		if err != nil {
+			return nil, fmt.Errorf("Provider base URL: %w", err)
+		}
+		responsesURL, err := endpointURL(configuredProvider.BaseURL, "responses")
 		if err != nil {
 			return nil, fmt.Errorf("Provider base URL: %w", err)
 		}
 		selected := &provider{
 			Provider:        configuredProvider,
 			chatURL:         chatURL,
+			responsesURL:    responsesURL,
 			reasoningEffort: resolveReasoningEffort(normalizedEffort, configuredProvider),
 		}
 		providers = append(providers, selected)
@@ -270,7 +287,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if r.URL.Path != chatCompletionsPath {
+	var routeEndpoint endpoint
+	switch r.URL.Path {
+	case chatCompletionsPath:
+		routeEndpoint = endpointChatCompletions
+	case responsesPath:
+		routeEndpoint = endpointResponses
+	default:
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -296,7 +319,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.route(w, r, payload)
+	s.route(w, r, payload, routeEndpoint)
 }
 
 // openAIErrorResponse mirrors the error envelope used by the OpenAI API. The
@@ -415,7 +438,7 @@ type routeFailure struct {
 	category string
 }
 
-func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
+func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage, routeEndpoint endpoint) {
 	requestStarted := time.Now()
 	model, err := requestModel(payload)
 	if err != nil {
@@ -480,10 +503,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					return
 				}
 
+				upstreamURL := selected.chatURL
+				if routeEndpoint == endpointResponses {
+					upstreamURL = selected.responsesURL
+				}
 				upstreamRequest, err := http.NewRequestWithContext(
 					r.Context(),
 					http.MethodPost,
-					selected.chatURL,
+					upstreamURL,
 					bytes.NewReader(upstreamBody),
 				)
 				if err != nil {
@@ -506,7 +533,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					}
 					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 					s.metrics.recordResponse(s.metricProviderName(selected), 0, category)
-					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 					lastFailure = routeFailure{status: http.StatusBadGateway, category: category}
 					s.handleFailoverFailure(selected, category, 0)
 					continue
@@ -537,7 +564,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 						}
 						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, category)
-						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: category}
 						s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
 						continue
@@ -556,9 +583,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage, responseBody) {
 						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "reasoning-effort")
-						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: "reasoning-effort"}
 						s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
+						continue
+					}
+
+					if routeEndpoint == endpointResponses && isUnsupportedResponsesEndpoint(upstreamResponse.StatusCode, responseBody) {
+						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: "unsupported-endpoint"}
+						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "unsupported-endpoint")
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
+						s.handleFailoverFailure(selected, "unsupported-endpoint", upstreamResponse.StatusCode)
 						continue
 					}
 
@@ -567,7 +603,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					_, _ = w.Write(responseBody)
 					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 					s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "client-error")
-					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 					return
 				}
 
@@ -579,10 +615,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				if streaming {
 					copyHeaders(w.Header(), upstreamResponse.Header)
 					w.WriteHeader(upstreamResponse.StatusCode)
-					completed := s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
+					completed := s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body, routeEndpoint)
 					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 					if completed {
-						s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
+						s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds(), routeEndpoint)
 					}
 					return
 				}
@@ -596,7 +632,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					lastFailure = routeFailure{status: http.StatusBadGateway, category: "upstream-read"}
 					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 					s.metrics.recordResponse(s.metricProviderName(selected), http.StatusBadGateway, "upstream-read")
-					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 					s.handleFailoverFailure(selected, "upstream-read", http.StatusBadGateway)
 					continue
 				}
@@ -605,7 +641,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: emptyCompletionCategory}
 					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
 					s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, emptyCompletionCategory)
-					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 					s.handleFailoverFailure(selected, emptyCompletionCategory, upstreamResponse.StatusCode)
 					continue
 				}
@@ -619,7 +655,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				w.WriteHeader(upstreamResponse.StatusCode)
 				_, _ = w.Write(responseBody)
 				s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
-				s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
+				s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds(), routeEndpoint)
 				return
 			}
 
@@ -776,7 +812,7 @@ func isSSEDoneLine(line []byte) bool {
 		bytes.Equal(line, []byte("data: "+sseDoneMarker))
 }
 
-func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) bool {
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader, routeEndpoint endpoint) bool {
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
@@ -802,7 +838,7 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			}
 			acc.observe(chunk)
 			if writeErr != nil {
-				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc, routeEndpoint,
 					fmt.Sprintf("client-write error: %v", writeErr))
 				return false
 			}
@@ -824,22 +860,22 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			if acc.sawDone() {
 				return true
 			}
-			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc, routeEndpoint,
 				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
 			s.markCooldown(selected)
 			return false
 		}
 
-		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
+		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc, routeEndpoint,
 			fmt.Sprintf("upstream read error: %v", readErr))
 		s.handleFailoverFailure(selected, "stream", statusCode)
 		return false
 	}
 }
 
-func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, reason string) {
+func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, routeEndpoint endpoint, reason string) {
 	s.metrics.recordStreamAbort(s.metricProviderName(selected), streamAbortCategory(reason))
-	s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
+	s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 	providerName := s.redactProviderSecrets(selected.Name)
 	redactedReason := s.redactProviderSecrets(reason)
 	if s.payloadLoggingEnabled() {
@@ -1245,13 +1281,26 @@ func isEmptyCompletion(responseBody []byte) bool {
 	return true
 }
 
-func chatCompletionsURL(baseURL string) (string, error) {
+// isUnsupportedResponsesEndpoint distinguishes an upstream that simply does not
+// implement the Responses API (HTTP 404/405) from a genuine client error. A
+// well-formed POST to the canonical /v1/responses path only ever gets 404 from
+// upstream because that path does not exist there, so the fault belongs to the
+// upstream surface, not the client: the proxy hides it, fails over to the next
+// provider, and puts the non-Responses provider in cooldown. When every
+// provider in the route is unsupported the client gets the proxy's own clear
+// "all Providers failed: unsupported-endpoint" error rather than a bare
+// upstream 404 that could be misread as a model not in a broker whitelist.
+func isUnsupportedResponsesEndpoint(statusCode int, _ []byte) bool {
+	return statusCode == http.StatusNotFound || statusCode == http.StatusMethodNotAllowed
+}
+
+func endpointURL(baseURL, endpointPath string) (string, error) {
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return "", fmt.Errorf("base_url must be a valid URL: %w", err)
 	}
 	path := strings.TrimRight(parsed.Path, "/")
-	parsed.Path = path + "/chat/completions"
+	parsed.Path = path + "/" + endpointPath
 	parsed.RawPath = ""
 	return parsed.String(), nil
 }

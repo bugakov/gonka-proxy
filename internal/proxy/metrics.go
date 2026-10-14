@@ -19,7 +19,7 @@ type metricsCollector struct {
 }
 
 type providerMetrics struct {
-	requests          map[string]uint64
+	requests          map[requestMetricKey]uint64
 	upstreamAttempts  uint64
 	upstreamResponses map[responseMetricKey]uint64
 	failovers         map[string]uint64
@@ -33,6 +33,16 @@ type providerMetrics struct {
 type responseMetricKey struct {
 	status   string
 	category string
+}
+
+// requestMetricKey keys a per-provider request result by the API endpoint the
+// call arrived on, so /v1/chat/completions and /v1/responses traffic is counted
+// separately in gonka_proxy_provider_requests_total. endpoint stays a string
+// so the requests histogram does not need to resolve a proxy endpoint back to a
+// metric label.
+type requestMetricKey struct {
+	endpoint string
+	result   string
 }
 
 type metricHistogram struct {
@@ -52,7 +62,7 @@ func (m *metricsCollector) provider(name string) *providerMetrics {
 	provider := m.providers[name]
 	if provider == nil {
 		provider = &providerMetrics{
-			requests:          make(map[string]uint64),
+			requests:          make(map[requestMetricKey]uint64),
 			upstreamResponses: make(map[responseMetricKey]uint64),
 			failovers:         make(map[string]uint64),
 			streamAborts:      make(map[string]uint64),
@@ -76,10 +86,10 @@ func (m *metricsCollector) recordRequestStart(name string) {
 	m.provider(name).upstreamAttempts++
 }
 
-func (m *metricsCollector) recordRequest(name, result string, durationSeconds float64) {
+func (m *metricsCollector) recordRequest(name, result string, durationSeconds float64, ep endpoint) {
 	m.mu.Lock()
 	provider := m.provider(name)
-	provider.requests[result]++
+	provider.requests[requestMetricKey{endpoint: string(ep), result: result}]++
 	if result == "success" {
 		recordHistogram(&provider.requestLatency, durationSeconds)
 	}
@@ -162,8 +172,18 @@ func (m *metricsCollector) serveHTTP(w io.Writer) error {
 	for _, name := range names {
 		provider := m.providers[name]
 		labels := `provider="` + escapeMetricLabel(name) + `"`
-		for _, result := range sortedUint64Keys(provider.requests) {
-			if _, err := fmt.Fprintf(w, "gonka_proxy_provider_requests_total{%s,result=\"%s\"} %d\n", labels, result, provider.requests[result]); err != nil {
+		requestKeys := make([]requestMetricKey, 0, len(provider.requests))
+		for key := range provider.requests {
+			requestKeys = append(requestKeys, key)
+		}
+		sort.Slice(requestKeys, func(i, j int) bool {
+			if requestKeys[i].endpoint == requestKeys[j].endpoint {
+				return requestKeys[i].result < requestKeys[j].result
+			}
+			return requestKeys[i].endpoint < requestKeys[j].endpoint
+		})
+		for _, key := range requestKeys {
+			if _, err := fmt.Fprintf(w, "gonka_proxy_provider_requests_total{%s,endpoint=\"%s\",result=\"%s\"} %d\n", labels, escapeMetricLabel(key.endpoint), key.result, provider.requests[key]); err != nil {
 				return err
 			}
 		}
