@@ -20,25 +20,31 @@ been reviewed.
    `model_routes`. Keep the existing scalar `model_alias` until the new routes
    have been verified; when both forms are present, `model_aliases` is used for
    a route.
-4. Build and test the binary before replacing the running service:
+4. Test and build the binary before replacing the running service. Build
+   locally only to smoke-check; the deployable artifact is produced by GitHub
+   Actions (see [Deploying](../README.md#deploying)):
 
    ```sh
    go test ./...
    go vet ./...
-   go build -o gonka-proxy ./cmd/gonka-proxy
+   go build -o /tmp/gonka-proxy ./cmd/gonka-proxy   # smoke-check only
    ```
 
-5. Restart the native service and verify it before changing Goose:
+5. Deploy and restart the native service, then verify it before changing
+   Goose. The production process is supervised by `oxmgr`, not systemd:
+   always use `oxmgr restart` — after an `oxmgr stop`, a plain `oxmgr start`
+   fails with `failed to spawn` even for a healthy binary:
 
    ```sh
-   sudo systemctl restart gonka-proxy
-   sudo systemctl is-active --quiet gonka-proxy
+   oxmgr restart gonka-proxy
+   oxmgr status gonka-proxy
    curl --fail http://127.0.0.1:58081/v1/models
    curl --fail http://127.0.0.1:58081/health
    ```
 
-   The systemd unit reads `/home/scanum/gonka-proxy/config.yaml`; adapt the
-   path if the service is installed elsewhere.
+   `oxmgr` reads `/home/scanum/gonka-proxy/config.yaml` and runs the binary at
+   `/home/scanum/gonka-proxy/gonka-proxy`; adapt the paths if the service is
+   installed elsewhere.
 
 6. Send one non-sensitive smoke request for each configured Virtual Model and
    inspect `/metrics`, `/health`, and `/diagnostics`. If validation or smoke
