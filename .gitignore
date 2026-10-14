@@ -57,6 +57,8 @@ id_ed25519
 # Compiled proxy binary (root).
 /gonka-proxy
 /gonka-proxy.exe
+# Backups of the binary made during deploys (cp gonka-proxy gonka-proxy.bak-<ts>).
+/gonka-proxy.bak-*
 
 # Test binaries, coverage, fuzz corpora.
 *.test
