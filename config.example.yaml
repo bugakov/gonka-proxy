@@ -31,6 +31,12 @@ health_history_path: health-history.json
 # Default when you want reasoning: max. Most of providers already support it. See README for details.
 reasoning_effort: max
 
+# When true, an upstream HTTP 404 is treated as a failover error like 5xx/429/402:
+# the provider goes into cooldown and the request is retried on the next provider.
+# Handy for brokers that answer 404 "model not found" when a model is temporarily
+# absent. Defaults to false, in which case a 404 is returned to the client as-is.
+failover_on_404: false
+
 # List of upstream Gonka Providers the proxy can route to. These are
 # placeholders, not real credentials. The legacy model_alias form below is
 # still supported and automatically serves the gonka Virtual Model.

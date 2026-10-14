@@ -44,6 +44,37 @@ providers:
 	}
 }
 
+func TestLoadParsesFailoverOn404(t *testing.T) {
+	t.Run("defaults_to_false", func(t *testing.T) {
+		cfg := loadConfig(t, `reasoning_effort: max
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`)
+		if cfg.FailoverOn404 {
+			t.Errorf("FailoverOn404 = true, want false by default")
+		}
+	})
+
+	t.Run("parses_true", func(t *testing.T) {
+		cfg := loadConfig(t, `reasoning_effort: max
+failover_on_404: true
+providers:
+  - name: primary
+    base_url: https://provider.example/v1
+    api_key: provider-secret
+    model_alias: provider-model
+    priority: 10
+`)
+		if !cfg.FailoverOn404 {
+			t.Errorf("FailoverOn404 = false, want true")
+		}
+	})
+}
+
 func TestLoadParsesModelAliasesAndRoutes(t *testing.T) {
 	cfg := loadConfig(t, `reasoning_effort: max
 providers:

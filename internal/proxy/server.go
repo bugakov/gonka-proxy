@@ -64,6 +64,7 @@ type Server struct {
 	metrics          *metricsCollector
 	cooldownDuration time.Duration
 	recoveryWait     time.Duration
+	failoverOn404    bool
 	cooldownMu       sync.Mutex
 	cooldownVersion  uint64
 	logger           Logger
@@ -183,6 +184,7 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		fallbackMode:     len(cfg.ModelRoutes) > 0,
 		cooldownDuration: cfg.Cooldown,
 		recoveryWait:     cfg.RecoveryWait,
+		failoverOn404:    cfg.FailoverOn404,
 		client: &http.Client{
 			Transport: transport,
 		},
@@ -506,7 +508,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 
 				if upstreamResponse.StatusCode != http.StatusOK {
 					statusCode := upstreamResponse.StatusCode
-					if isFailoverStatus(upstreamResponse.StatusCode) {
+					if isFailoverStatus(upstreamResponse.StatusCode) || (s.failoverOn404 && upstreamResponse.StatusCode == http.StatusNotFound) {
 						var errorMessage string
 						if s.payloadLoggingEnabled() {
 							responseBody, readErr := readErrorBodyForLog(upstreamResponse.Body)
@@ -523,6 +525,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 							category = "payment-required"
 						case http.StatusTooManyRequests:
 							category = "rate-limit"
+						case http.StatusNotFound:
+							category = "not-found"
 						}
 						lastFailure = routeFailure{status: statusCode, category: category}
 						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())

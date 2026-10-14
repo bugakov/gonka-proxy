@@ -8,7 +8,7 @@ Tiny and cheap: it runs in under **10 MB of RAM** even under load, so you can ru
 
 - Exposes **one local OpenAI-compatible endpoint** (`/v1/chat/completions`) — your app keeps talking to one URL, no matter what's happening upstream. The Responses API (`/v1/responses`) is proxied the same way, with the same routing, failover, cooldown, redaction, and error-remapping rules.
 - Maintains a **priority-ordered pool of providers** (e.g. primary, then backups).
-- On a **402, 429 or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order.
+- On a **402, 429 or 5xx** (or a timeout/network error), it **fails over** to the next available provider in order. Set `failover_on_404: true` to also fail over on an upstream 404 (handy when a broker reports "model not found" for a temporarily absent model).
 - A failed provider goes into a short **cooldown**, then comes back automatically. If every provider is down, it waits and retries until one responds or you cancel.
 - Maps one or more **virtual model names** to each provider's real model, so clients don't need to know or care which upstream you're using.
 - Enforces one **reasoning effort** setting on every upstream request, with per-provider overrides for backends that don't support the parameter.
@@ -35,6 +35,7 @@ log_level: WARN           # INFO, WARN (default), or ERROR
 health_history_path: health-history.json  # persistent provider health history
 
 reasoning_effort: xhigh   # required; see "Reasoning effort" below
+failover_on_404: false    # optional; treat upstream 404 as a failover error (default false)
 
 providers:                # one block per upstream, higher priority = preferred
   - name: primary

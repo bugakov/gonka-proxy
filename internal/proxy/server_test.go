@@ -1971,6 +1971,89 @@ func TestChatCompletionsFailsOverOnPaymentRequired(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsFailoverOn404(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		failoverOn404  bool
+		wantStatusCode int
+		wantBackupHit  bool
+	}{
+		{name: "enabled_fails_over", failoverOn404: true, wantStatusCode: http.StatusOK, wantBackupHit: true},
+		{name: "disabled_returns_404", failoverOn404: false, wantStatusCode: http.StatusNotFound, wantBackupHit: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var notFoundHits atomic.Int32
+			var backupHits atomic.Int32
+
+			notFoundProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				notFoundHits.Add(1)
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":"model_not_found"}`)
+			}))
+			defer notFoundProvider.Close()
+
+			backupProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				backupHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"provider":"backup"}`)
+			}))
+			defer backupProvider.Close()
+
+			configuredProviders := []config.Provider{
+				{Name: "not-found-provider", BaseURL: notFoundProvider.URL + "/v1", APIKey: "not-found-secret", ModelAlias: "not-found-model", Priority: 100},
+				{Name: "backup-provider", BaseURL: backupProvider.URL + "/v1", APIKey: "backup-secret", ModelAlias: "backup-model", Priority: 50},
+			}
+			handler, err := proxy.NewWithLogger(config.Config{
+				ListenAddress:         "127.0.0.1:8080",
+				Cooldown:              time.Second,
+				RecoveryWait:          time.Second,
+				ResponseHeaderTimeout: time.Second,
+				LogLevel:              config.LogLevelError,
+				ReasoningEffort:       effortPtr(config.ReasoningEffortHigh),
+				FailoverOn404:         testCase.failoverOn404,
+				Providers:             configuredProviders,
+			}, log.New(io.Discard, "", 0))
+			if err != nil {
+				t.Fatalf("create proxy: %v", err)
+			}
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"virtual-model","messages":[]}`))
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != testCase.wantStatusCode {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, testCase.wantStatusCode)
+			}
+			if got := notFoundHits.Load(); got != 1 {
+				t.Fatalf("not-found Provider received %d requests, want 1", got)
+			}
+			if got := backupHits.Load(); got != boolToInt(testCase.wantBackupHit) {
+				t.Fatalf("backup Provider received %d requests, want %d", got, boolToInt(testCase.wantBackupHit))
+			}
+			if testCase.wantStatusCode == http.StatusOK {
+				responseBody, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Fatalf("read response body: %v", err)
+				}
+				if string(responseBody) != `{"provider":"backup"}` {
+					t.Fatalf("response body = %s, want backup response", responseBody)
+				}
+			}
+		})
+	}
+}
+
+func boolToInt(value bool) int32 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func TestChatCompletionsFailsOverOnUnsupportedReasoningEffort(t *testing.T) {
 	for _, testCase := range []struct {
 		name string

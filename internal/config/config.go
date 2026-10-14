@@ -119,6 +119,7 @@ type Config struct {
 	LogLevel              LogLevel
 	HealthHistoryPath     string
 	ReasoningEffort       *ReasoningEffort
+	FailoverOn404         bool
 	Providers             []Provider
 	ModelRoutes           map[string]ModelRoute
 	ModelRouteOrder       []string
@@ -171,6 +172,7 @@ type rawConfig struct {
 	LogLevel              string                   `yaml:"log_level"`
 	HealthHistoryPath     string                   `yaml:"health_history_path"`
 	ReasoningEffort       *string                  `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
+	FailoverOn404         bool                     `yaml:"failover_on_404"`
 	Providers             []rawProvider            `yaml:"providers"`
 	ModelRoutes           map[string]rawModelRoute `yaml:"model_routes"`
 }
@@ -267,6 +269,7 @@ func Load(path string) (Config, error) {
 		LogLevel:              LogLevel(DefaultLogLevel),
 		HealthHistoryPath:     strings.TrimSpace(raw.HealthHistoryPath),
 		ReasoningEffort:       parsedReasoningEffort,
+		FailoverOn404:         raw.FailoverOn404,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
 		ModelRoutes:           make(map[string]ModelRoute, len(raw.ModelRoutes)),
 		ModelRouteOrder:       modelRouteOrder,
