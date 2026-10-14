@@ -1311,6 +1311,20 @@ func TestInitialVirtualModelsRouteEndToEnd(t *testing.T) {
 	if unknown.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
 	}
+	unknownBody, _ := io.ReadAll(unknown.Body)
+	var unknownErr struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(unknownBody, &unknownErr); err != nil {
+		t.Fatalf("unknown-model error body is not valid JSON: %v; body = %q", err, unknownBody)
+	}
+	if unknownErr.Error.Type != "invalid_request_error" || unknownErr.Error.Code != "model_not_found" {
+		t.Fatalf("unknown-model error envelope = %#v, want type=invalid_request_error code=model_not_found", unknownErr.Error)
+	}
 }
 
 func TestModelsPublishesFloorAcrossRouteProviders(t *testing.T) {
@@ -1795,6 +1809,20 @@ func TestChatCompletionsReturnsFinalFailureAfterFallbackChain(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "all Providers failed: server-error") {
 		t.Fatalf("body = %q", body)
+	}
+	// The body must be an OpenAI-style JSON error, not plain text.
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		t.Fatalf("error body is not valid JSON: %v; body = %q", err, body)
+	}
+	if errResp.Error.Type != "server_error" || errResp.Error.Code != "server-error" {
+		t.Fatalf("error envelope = %#v, want type=server_error code=server-error", errResp.Error)
 	}
 }
 

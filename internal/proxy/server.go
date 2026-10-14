@@ -421,7 +421,15 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 		routeName = "gonka"
 	}
 	if _, ok := s.routes[routeName]; !ok {
-		http.Error(w, fmt.Sprintf("unknown model %q", model), http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(openAIErrorResponse{
+			Error: openAIError{
+				Message: fmt.Sprintf("Model %q not found. Check /v1/models for available models.", model),
+				Type:    "invalid_request_error",
+				Code:    "model_not_found",
+			},
+		})
 		return
 	}
 
@@ -433,14 +441,30 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 			return
 		}
 		if _, exists := visited[routeName]; exists {
-			http.Error(w, "fallback route visited more than once", http.StatusBadGateway)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(openAIErrorResponse{
+				Error: openAIError{
+					Message: "Fallback chain loop detected. Request routed through the same model twice.",
+					Type:    "invalid_request_error",
+					Code:    "fallback_loop",
+				},
+			})
 			return
 		}
 		visited[routeName] = struct{}{}
 
 		routeProviders := s.routes[routeName]
 		if len(routeProviders) == 0 {
-			http.Error(w, "no Providers configured for model", http.StatusServiceUnavailable)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(openAIErrorResponse{
+				Error: openAIError{
+					Message: fmt.Sprintf("Model %q is not configured. Check /v1/models for available models.", routeName),
+					Type:    "server_error",
+					Code:    "model_not_configured",
+				},
+			})
 			return
 		}
 		var lastFailure routeFailure
@@ -646,12 +670,39 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 	}
 }
 
+// openAIErrorResponse mirrors the error format used by the OpenAI API.
+type openAIErrorResponse struct {
+	Error openAIError `json:"error"`
+}
+
+type openAIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+}
+
 func (s *Server) writeRouteFailure(w http.ResponseWriter, failure routeFailure) {
-	if failure.status == 0 {
-		http.Error(w, "all Providers are unavailable", http.StatusServiceUnavailable)
-		return
+	// Preserve the last upstream status so clients see the real failure
+	// (e.g. 404 from an unsupported-endpoint, 502 from a server-error) instead
+	// of being flattened to 503. This is the core failover contract: the proxy
+	// passes through the upstream response when every provider fails.
+	statusCode := failure.status
+	if statusCode == 0 {
+		statusCode = http.StatusServiceUnavailable
 	}
-	http.Error(w, fmt.Sprintf("all Providers failed: %s", failure.category), failure.status)
+	message := fmt.Sprintf("all Providers failed: %s", failure.category)
+	if failure.category == "" {
+		message = "all Providers unavailable"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(openAIErrorResponse{
+		Error: openAIError{
+			Message: message,
+			Type:    "server_error",
+			Code:    failure.category,
+		},
+	})
 }
 
 func (s *Server) waitForRecovery(ctx context.Context) bool {
