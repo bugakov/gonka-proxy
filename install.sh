@@ -68,6 +68,9 @@ case "$ARCH" in
 esac
 
 ASSET="${ASSET_OVERRIDE:-gonka-proxy-${os}-${arch}}"
+# Alternate name used by older rolling releases that uploaded the binary
+# without a platform suffix. Tried only if the primary asset 404s.
+FALLBACK_ASSET="gonka-proxy"
 URL="${RELEASES_URL}/${ASSET}"
 
 # ---- resolve install dir ----
@@ -122,7 +125,7 @@ fetch_asset() {
         log "download attempt $n/$TRIES failed; retrying..."
         [ "$n" -lt "$TRIES" ] && sleep 3
     done
-    [ "$ok" = "1" ] || { rm -f "$TMP"; die "download failed after $TRIES attempts ($NAME)"; }
+    [ "$ok" = "1" ] || { rm -f "$TMP"; log "download failed after $TRIES attempts ($NAME)"; return 1; }
 
     SZ=$(wc -c < "$TMP" 2>/dev/null || echo 0)
     if [ "$SZ" -lt 100000 ]; then
@@ -146,7 +149,11 @@ mkdir -p "$BAK_DIR_TMP" || die "cannot create $BAK_DIR_TMP"
 
 TARGET="$INSTALL_DIR/gonka-proxy"
 log "Downloading $ASSET from $URL"
-fetch_asset "$URL" "$BAK_DIR_TMP" "$ASSET" "$TARGET"
+if ! fetch_asset "$URL" "$BAK_DIR_TMP" "$ASSET" "$TARGET"; then
+    log "asset '$ASSET' not found; trying fallback '$FALLBACK_ASSET'"
+    FALLBACK_URL="${RELEASES_URL}/${FALLBACK_ASSET}"
+    fetch_asset "$FALLBACK_URL" "$BAK_DIR_TMP" "$FALLBACK_ASSET" "$TARGET" || die "download failed for $ASSET and $FALLBACK_ASSET"
+fi
 
 rm -rf "$BAK_DIR_TMP"
 
