@@ -359,6 +359,73 @@ Every service mounts its config at the same in-container path (`/etc/gonka-proxy
 go run ./cmd/gonka-proxy --config config.yaml
 ```
 
+## Deploying
+
+The production process is supervised by `oxmgr`, not systemd. It runs the
+binary at `/home/scanum/gonka-proxy/gonka-proxy` with `--config
+/home/scanum/gonka-proxy/config.yaml`. Rebuild and redeploy via GitHub Actions,
+never by building on the server.
+
+Every push to `main` runs the test suite, publishes a `linux/amd64` binary as
+the `gonka-proxy-linux-amd64` Actions artifact (`CGO_ENABLED=0`,
+`-trimpath -s -w`), and updates a rolling GitHub **release**. Two ways to
+deploy:
+
+### One-liner (release)
+
+The rolling release always points at the latest green `main` build, so any
+host with the binary's target directory can install/update it in one step:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bugakov/gonka-proxy/main/install.sh | sh -- --dir /home/scanum/gonka-proxy --restart
+```
+
+`install.sh` supports `--dir`, `--restart` (restarts the oxmgr service),
+`--service NAME`, `--asset NAME`, `--dry-run` and `--version`. Without `--dir`
+it installs to `~/.local/bin`.
+
+### Manual (artifact)
+
+1. Push to `main`. The `build-artifact` job publishes a `linux/amd64` binary
+   as the `gonka-proxy-linux-amd64` artifact.
+2. Download the artifact — either from the Actions run page (Artifacts →
+   download) or from the CLI:
+
+   ```sh
+   gh run download <run-id> --repo bugakov/gonka-proxy
+   unzip -o gonka-proxy-linux-amd64/gonka-proxy.zip -d gonka-proxy-linux-amd64/
+   ```
+
+3. Back up the running binary, replace it with the artifact, and restart:
+
+   ```sh
+   cp gonka-proxy "gonka-proxy.$(date +%Y%m%d-%H%M%S).bak"
+   cp ./gonka-proxy-linux-amd64/gonka-proxy gonka-proxy
+   chmod +x gonka-proxy
+   oxmgr restart gonka-proxy
+   ```
+
+4. Verify before relying on it:
+
+   ```sh
+   oxmgr status gonka-proxy
+   curl --fail http://127.0.0.1:58081/v1/models
+   curl --fail http://127.0.0.1:58081/health
+   ```
+
+Notes:
+
+- **Always use `oxmgr restart`.** After an `oxmgr stop`, a plain `oxmgr start`
+  fails with `failed to spawn` even for a healthy binary; `restart` performs a
+  clean stop+start cycle. If a start ever fails this way, reach for
+  `oxmgr restart`, not a manual process launch.
+- The binary `/gonka-proxy` and `config.yaml` are gitignored (`.gitignore`), so
+  deployments and credentials never enter a commit. Backups
+  (`gonka-proxy.*.bak`) are ignored the same way; remove them after a
+  successful rollout.
+- After a provider-pool change, run `limits-check` to confirm the published
+  floors match the live minimum (see [Model limits](#model-limits)).
+
 For a zero-downtime-conscious migration from scalar `model_alias` settings,
 including backup, validation, systemd restart, and rollback checks, see
 [`docs/multi-model-rollout.md`](docs/multi-model-rollout.md).

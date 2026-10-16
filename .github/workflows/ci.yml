@@ -67,6 +67,54 @@ jobs:
           path: gonka-proxy
           if-no-files-found: error
 
+  release:
+    name: release (rolling)
+    runs-on: ubuntu-24.04
+    needs: test
+    # Rolling release is only meaningful on main; PRs and other branches
+    # still get the Actions artifact from build-artifact above.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.22"
+
+      - name: Build binary
+        shell: bash
+        run: |
+          set -eu
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags='-s -w' -o gonka-proxy ./cmd/gonka-proxy
+
+      - name: Publish rolling release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Recreate the rolling release. github.ref is short-lived and points
+          # at the main branch, so a fresh tag per run stays valid.
+          tag="ci-$(date +%Y%m%d%H%M%S)"
+          gh release create "$tag" gonka-proxy \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Rolling build $tag" \
+            --target "$GITHUB_SHA"
+          # Mark it as the latest release so /releases/latest serves this build.
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --latest
+          # Drop the old rolling release so tags don't pile up.
+          old=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+                  --json tagName --jq '.[].tagName' \
+                | grep -E '^ci-[0-9]{14}$' | grep -v "^$tag$" || true)
+          for t in $old; do
+            gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes || true
+          done
+
   smoke:
     name: smoke
     runs-on: ubuntu-24.04
