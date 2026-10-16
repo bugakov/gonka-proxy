@@ -52,6 +52,61 @@ func (l LogLevel) Enabled(level LogLevel) bool {
 	return level.severity() >= l.severity()
 }
 
+// FilterDisabledProviders removes the named providers from the configuration
+// and re-validates the result. It applies the operator-controlled provider
+// state file on top of config.yaml: a disabled provider vanishes from the
+// routing pool, from every model route that references it, and from
+// model_route_order validation. Names are trimmed; unknown names are ignored
+// so a stale state entry never breaks startup. An empty or nil disabled list
+// returns the configuration unchanged.
+//
+// The result is re-validated because disabling can break the configuration:
+// disabling every provider fails validation exactly like an empty providers
+// list in config.yaml would.
+func FilterDisabledProviders(cfg Config, disabled []string) (Config, error) {
+	if len(disabled) == 0 {
+		return cfg, nil
+	}
+	blocked := make(map[string]struct{}, len(disabled))
+	for _, name := range disabled {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			blocked[name] = struct{}{}
+		}
+	}
+	if len(blocked) == 0 {
+		return cfg, nil
+	}
+	providers := make([]Provider, 0, len(cfg.Providers))
+	for _, provider := range cfg.Providers {
+		if _, disabledProvider := blocked[strings.TrimSpace(provider.Name)]; disabledProvider {
+			continue
+		}
+		providers = append(providers, provider)
+	}
+	cfg.Providers = providers
+	for routeName, route := range cfg.ModelRoutes {
+		if len(route.Providers) == 0 {
+			continue
+		}
+		kept := make([]string, 0, len(route.Providers))
+		for _, providerName := range route.Providers {
+			if _, disabledProvider := blocked[strings.TrimSpace(providerName)]; disabledProvider {
+				continue
+			}
+			kept = append(kept, providerName)
+		}
+		route.Providers = kept
+		cfg.ModelRoutes[routeName] = route
+	}
+	// Re-validate so a disabling mistake surfaces at startup with the same
+	// actionable errors config.yaml itself produces.
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("provider state leaves configuration invalid: %w", err)
+	}
+	return cfg, nil
+}
+
 // ReasoningEffort is the provider reasoning intensity. Nil means null/disabled.
 type ReasoningEffort string
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,24 +23,44 @@ const shutdownTimeout = 10 * time.Second
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
+	statePath := flag.String("provider-state", "", "path to the provider state file (default: provider-state.json next to the config)")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger := log.New(os.Stdout, "", log.LstdFlags)
-	if err := run(ctx, *configPath, logger); err != nil {
+	resolvedStatePath := *statePath
+	if resolvedStatePath == "" {
+		resolvedStatePath = config.DefaultStatePath(*configPath)
+	}
+	if err := runWithState(ctx, *configPath, resolvedStatePath, logger); err != nil {
 		logger.Printf("error=%v", err)
 		os.Exit(1)
 	}
 }
 
 func run(ctx context.Context, configPath string, logger proxy.Logger) error {
+	return runWithState(ctx, configPath, config.DefaultStatePath(configPath), logger)
+}
+
+func runWithState(ctx context.Context, configPath, statePath string, logger proxy.Logger) error {
 	if logger == nil {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
+	}
+	state, err := config.LoadProviderState(statePath)
+	if err != nil {
+		return fmt.Errorf("load provider state: %w", err)
+	}
+	if len(state.Disabled) > 0 {
+		cfg, err = config.FilterDisabledProviders(cfg, state.Disabled)
+		if err != nil {
+			return fmt.Errorf("apply provider state: %w", err)
+		}
+		logger.Printf("provider state: disabled %s", strings.Join(state.Disabled, ", "))
 	}
 	handler, err := proxy.NewWithLogger(cfg, logger)
 	if err != nil {
