@@ -1229,10 +1229,13 @@ func isEmptyCompletion(responseBody []byte) bool {
 // Providers answer those with HTTP 401 (some with 403) and a body like
 // {"error":{"message":"API key is paused or access disabled. Check its status:
 // https://app.gonkabroker.com/api-keys","type":"invalid_request_error",
-// "code":"invalid_api_key"}}. Such a response can never succeed on the same
-// provider no matter how often it is retried, so it is a Failover Failure like a
-// 402 rather than a Client Error the end user should see: the proxy hides it,
-// routes around the disabled provider, and puts it in cooldown.
+// "code":"invalid_api_key"}}. Brokers running LiteLLM phrase it as
+// {"error":{"message":"Authentication Error, Key is blocked. Update via
+// `/key/unblock` if you're an admin.","type":"auth_error","code":"401"}}.
+// Such a response can never succeed on the same provider no matter how often
+// it is retried, so it is a Failover Failure like a 402 rather than a Client
+// Error the end user should see: the proxy hides it, routes around the
+// disabled provider, and puts it in cooldown.
 //
 // A 401/403 without that hint stays a Client Error and is returned to the
 // client unchanged, because only the client knows whether its own request was
@@ -1253,6 +1256,9 @@ func failoverClientStatus(statusCode int, responseBody []byte) bool {
 		"api key disabled",
 		"key has been paused",
 		"key paused",
+		"key is blocked",
+		"key blocked",
+		"key has been blocked",
 	}
 	for _, candidate := range hints {
 		if bytes.Contains(lowered, []byte(candidate)) {
