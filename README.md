@@ -351,11 +351,30 @@ go run ./cmd/gonka-proxy --config config.yaml
 The production process is supervised by `oxmgr`, not systemd. It runs the
 binary at `/home/scanum/gonka-proxy/gonka-proxy` with `--config
 /home/scanum/gonka-proxy/config.yaml`. Rebuild and redeploy via GitHub Actions,
-never by building on the server:
+never by building on the server.
 
-1. Push to `main`. CI runs the test suite and the `build-artifact` job
-   publishes a `linux/amd64` binary as the `gonka-proxy-linux-amd64` artifact
-   (`CGO_ENABLED=0`, `-trimpath -s -w`).
+Every push to `main` runs the test suite, publishes a `linux/amd64` binary as
+the `gonka-proxy-linux-amd64` Actions artifact (`CGO_ENABLED=0`,
+`-trimpath -s -w`), and updates a rolling GitHub **release**. Two ways to
+deploy:
+
+### One-liner (release)
+
+The rolling release always points at the latest green `main` build, so any
+host with the binary's target directory can install/update it in one step:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bugakov/gonka-proxy/main/install.sh | sh -- --dir /home/scanum/gonka-proxy --restart
+```
+
+`install.sh` supports `--dir`, `--restart` (restarts the oxmgr service),
+`--service NAME`, `--asset NAME`, `--dry-run` and `--version`. Without `--dir`
+it installs to `~/.local/bin`.
+
+### Manual (artifact)
+
+1. Push to `main`. The `build-artifact` job publishes a `linux/amd64` binary
+   as the `gonka-proxy-linux-amd64` artifact.
 2. Download the artifact — either from the Actions run page (Artifacts →
    download) or from the CLI:
 
