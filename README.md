@@ -364,12 +364,14 @@ The rolling release always points at the latest green `main` build, so any
 host with the binary's target directory can install/update it in one step:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bugakov/gonka-proxy/main/install.sh | sh -- --dir /home/scanum/gonka-proxy --restart
+curl -fsSL https://raw.githubusercontent.com/bugakov/gonka-proxy/main/install.sh | sh -s -- --dir /home/scanum/gonka-proxy --restart
 ```
 
 `install.sh` supports `--dir`, `--restart` (restarts the oxmgr service),
-`--service NAME`, `--asset NAME`, `--dry-run` and `--version`. Without `--dir`
-it installs to `~/.local/bin`.
+`--service NAME`, `--asset NAME`, `--dry-run` and `--version`. Without
+`--dir`, it installs into the current directory when that holds a working
+install (`config.yaml` + `gonka-proxy`), otherwise into `~/.local/bin`. (`sh`
+needs `-s` so the script, streamed through the pipe, receives the arguments.)
 
 ### Manual (artifact)
 
