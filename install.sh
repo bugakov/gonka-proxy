@@ -1,22 +1,27 @@
 #!/bin/sh
 # gonka-proxy — download the latest rolling build from GitHub Releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/bugakov/gonka-proxy/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/bugakov/gonka-proxy/main/install.sh | sh -s -- --restart
 #
 # CI publishes a `latest` GitHub release (rolling, overwritten on every main
 # push) holding the linux/amd64 proxy binary. This script fetches it and drops
 # it into the target directory, backing up any existing binary first, and can
-# optionally restart the oxmgr-managed service the same way the README's
-# manual deploy does — only here the binary comes from a release, not a CI
-# artifact download.
+# optionally restart the oxmgr-managed service the same way the README's manual
+# deploy does — only here the binary comes from a release, not a CI artifact
+# download.
 #
 # Options:
-#   --dir DIR       install into DIR instead of auto-detecting (~/.local/bin)
+#   --dir DIR       install into DIR. Default: the current directory when it
+#                   holds a working install (config.yaml + gonka-proxy),
+#                   otherwise ~/.local/bin.
 #   --restart       restart the oxmgr service after replacing the binary
 #   --service NAME  oxmgr service name (default: gonka-proxy)
 #   --asset NAME    override the release asset name (default: gonka-proxy-linux-amd64)
 #   --version       print script version and exit
 #   --dry-run       resolve target + URL, do not install
+#
+# Note: when streamed through a pipe, `sh` needs -s to see the arguments:
+#   curl ... | sh -s -- --dir /tmp/probe --dry-run
 #
 # POSIX sh. No external deps beyond curl/wget.
 
@@ -66,7 +71,15 @@ ASSET="${ASSET_OVERRIDE:-gonka-proxy-${os}-${arch}}"
 URL="${RELEASES_URL}/${ASSET}"
 
 # ---- resolve install dir ----
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-}"
+if [ -z "$INSTALL_DIR" ]; then
+    # A working install looks like the repo root: config.yaml + the binary.
+    if [ -f ./config.yaml ] && [ -f ./gonka-proxy ]; then
+        INSTALL_DIR="$(pwd)"
+    else
+        INSTALL_DIR="$HOME/.local/bin"
+    fi
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
     printf 'OS=%s ARCH=%s\nASSET=%s\nURL=%s\nINSTALL_DIR=%s\nRESTART=%s\nSERVICE=%s\n' \
