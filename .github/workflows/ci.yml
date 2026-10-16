@@ -101,7 +101,10 @@ jobs:
           # Recreate the rolling release. github.ref is short-lived and points
           # at the main branch, so a fresh tag per run stays valid.
           tag="ci-$(date +%Y%m%d%H%M%S)"
-          gh release create "$tag" gonka-proxy \
+          # Upload under the platform name the installer expects so
+          # /releases/latest/download/gonka-proxy-linux-amd64 resolves.
+          cp gonka-proxy gonka-proxy-linux-amd64
+          gh release create "$tag" gonka-proxy-linux-amd64 \
             --repo "$GITHUB_REPOSITORY" \
             --title "Rolling build $tag" \
             --target "$GITHUB_SHA"
