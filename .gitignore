@@ -25,6 +25,9 @@
 /health-history.json
 /health-history*.json
 
+# brokerctl on/off state (local operator toggle, not part of tracked config).
+/provider-state.json
+
 # ---------------------------------------------------------------------------
 # Secrets anywhere (defensive; the tracked examples are named safely above,
 # so these wildcards do not collide with them).
@@ -57,6 +60,8 @@ id_ed25519
 # Compiled proxy binary (root).
 /gonka-proxy
 /gonka-proxy.exe
+# brokerctl binary built locally for deployment (go build -o gonka-proxy-brokerctl).
+/gonka-proxy-brokerctl
 # Backups of the binary made during deploys (cp gonka-proxy gonka-proxy.bak-<ts>).
 /gonka-proxy.bak-*
 

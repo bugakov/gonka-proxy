@@ -56,11 +56,15 @@ func runWithState(ctx context.Context, configPath, statePath string, logger prox
 		return fmt.Errorf("load provider state: %w", err)
 	}
 	if len(state.Disabled) > 0 {
-		cfg, err = config.FilterDisabledProviders(cfg, state.Disabled)
+		var droppedRoutes []string
+		cfg, droppedRoutes, err = config.FilterDisabledProviders(cfg, state.Disabled)
 		if err != nil {
 			return fmt.Errorf("apply provider state: %w", err)
 		}
 		logger.Printf("provider state: disabled %s", strings.Join(state.Disabled, ", "))
+		if len(droppedRoutes) > 0 {
+			logger.Printf("provider state: model routes with no providers left are disabled: %s", strings.Join(droppedRoutes, ", "))
+		}
 	}
 	handler, err := proxy.NewWithLogger(cfg, logger)
 	if err != nil {
