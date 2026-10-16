@@ -60,12 +60,20 @@ func (l LogLevel) Enabled(level LogLevel) bool {
 // so a stale state entry never breaks startup. An empty or nil disabled list
 // returns the configuration unchanged.
 //
-// The result is re-validated because disabling can break the configuration:
-// disabling every provider fails validation exactly like an empty providers
-// list in config.yaml would.
-func FilterDisabledProviders(cfg Config, disabled []string) (Config, error) {
+// The result is re-validated so a disabling mistake surfaces at startup with
+// the same actionable errors config.yaml itself produces. Disabling every
+// provider fails validation exactly like an empty providers list in
+// config.yaml would. A model route left without a single provider that can
+// serve it — every explicitly listed provider disabled, or a global route
+// whose only serving providers were disabled — is not an error: the route is
+// removed from the configuration (and from model_route_order) and reported
+// in the returned dropped routes slice, so the proxy keeps serving every
+// other model while requests for the removed one get a clean 503
+// model_not_configured at runtime. Fallbacks that pointed at a dropped route
+// are cleared so their routes keep working.
+func FilterDisabledProviders(cfg Config, disabled []string) (Config, []string, error) {
 	if len(disabled) == 0 {
-		return cfg, nil
+		return cfg, nil, nil
 	}
 	blocked := make(map[string]struct{}, len(disabled))
 	for _, name := range disabled {
@@ -75,7 +83,7 @@ func FilterDisabledProviders(cfg Config, disabled []string) (Config, error) {
 		}
 	}
 	if len(blocked) == 0 {
-		return cfg, nil
+		return cfg, nil, nil
 	}
 	providers := make([]Provider, 0, len(cfg.Providers))
 	for _, provider := range cfg.Providers {
@@ -85,26 +93,93 @@ func FilterDisabledProviders(cfg Config, disabled []string) (Config, error) {
 		providers = append(providers, provider)
 	}
 	cfg.Providers = providers
+	// Copy the route map so filtering never mutates the caller's
+	// configuration: ModelRoutes is a reference type and the caller may
+	// reuse the original (tests share fixtures; main.go reuses nothing,
+	// but the invariant is worth keeping).
+	routes := make(map[string]ModelRoute, len(cfg.ModelRoutes))
+	for routeName, route := range cfg.ModelRoutes {
+		routes[routeName] = route
+	}
+	cfg.ModelRoutes = routes
+	providersByName := make(map[string]Provider, len(providers))
+	for _, provider := range providers {
+		providersByName[strings.TrimSpace(provider.Name)] = provider
+	}
+
+	var droppedRoutes []string
 	for routeName, route := range cfg.ModelRoutes {
 		if len(route.Providers) == 0 {
+			// Global route: every configured provider that serves the model
+			// name is a candidate, so the route only dies when no remaining
+			// provider serves it — the same rule Validate applies.
+			if !routeHasServingProvider(providers, routeName) {
+				droppedRoutes = append(droppedRoutes, routeName)
+				delete(cfg.ModelRoutes, routeName)
+			}
 			continue
 		}
 		kept := make([]string, 0, len(route.Providers))
+		keptProviders := make([]Provider, 0, len(route.Providers))
 		for _, providerName := range route.Providers {
 			if _, disabledProvider := blocked[strings.TrimSpace(providerName)]; disabledProvider {
 				continue
 			}
 			kept = append(kept, providerName)
+			keptProviders = append(keptProviders, providersByName[strings.TrimSpace(providerName)])
+		}
+		// The route also dies when every provider left in it lost the
+		// ability to serve the model (an explicit list may mix serving and
+		// non-serving providers), because validation would reject it.
+		if len(kept) == 0 || !routeHasServingProvider(keptProviders, routeName) {
+			droppedRoutes = append(droppedRoutes, routeName)
+			delete(cfg.ModelRoutes, routeName)
+			continue
 		}
 		route.Providers = kept
 		cfg.ModelRoutes[routeName] = route
 	}
+	if len(droppedRoutes) > 0 {
+		dropped := make(map[string]struct{}, len(droppedRoutes))
+		for _, routeName := range droppedRoutes {
+			dropped[routeName] = struct{}{}
+		}
+		order := make([]string, 0, len(cfg.ModelRouteOrder))
+		for _, routeName := range cfg.ModelRouteOrder {
+			if _, isDropped := dropped[strings.TrimSpace(routeName)]; !isDropped {
+				order = append(order, routeName)
+			}
+		}
+		cfg.ModelRouteOrder = order
+		// Fallbacks pointing at a dropped route would fail validation;
+		// clear them so the surviving routes keep working.
+		for routeName, route := range cfg.ModelRoutes {
+			if fallback := strings.TrimSpace(route.Fallback); fallback != "" {
+				if _, isDropped := dropped[fallback]; isDropped {
+					route.Fallback = ""
+					cfg.ModelRoutes[routeName] = route
+				}
+			}
+		}
+		sort.Strings(droppedRoutes)
+	}
 	// Re-validate so a disabling mistake surfaces at startup with the same
 	// actionable errors config.yaml itself produces.
 	if err := cfg.Validate(); err != nil {
-		return Config{}, fmt.Errorf("provider state leaves configuration invalid: %w", err)
+		return Config{}, nil, fmt.Errorf("provider state leaves configuration invalid: %w", err)
 	}
-	return cfg, nil
+	return cfg, droppedRoutes, nil
+}
+
+// routeHasServingProvider reports whether at least one of the providers can
+// serve the model route, using the same alias rule as Validate.
+func routeHasServingProvider(providers []Provider, routeName string) bool {
+	for _, provider := range providers {
+		if _, ok := provider.ModelAliasFor(routeName); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ReasoningEffort is the provider reasoning intensity. Nil means null/disabled.
