@@ -139,13 +139,13 @@ type ModelRoute struct {
 // reasoning_effort, which wins over the global value. An explicit null strips
 // the field. Leave all three unset to inherit global.
 type Provider struct {
-	Name           string
-	BaseURL        string
-	APIKey         string
-	ModelAlias     string
-	ModelAliases   map[string]string
-	Models         []string
-	Priority       int
+	Name         string
+	BaseURL      string
+	APIKey       string
+	ModelAlias   string
+	ModelAliases map[string]string
+	Models       []string
+	Priority     int
 
 	// HealthCheckURL and BalanceURL drive the /diagnostics endpoint. When
 	// HealthCheckURL is empty, diagnostics probes BaseURL + "/models".

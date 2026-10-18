@@ -711,6 +711,403 @@ func TestModelsListsConfiguredRoutesInDeclarationOrder(t *testing.T) {
 	}
 }
 
+func TestInitialVirtualModelsRouteEndToEnd(t *testing.T) {
+	var upstreamModels []string
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		upstreamModels = append(upstreamModels, payload.Model)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"ok"}`)
+	}))
+	defer provider.Close()
+
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "gonka-router", BaseURL: provider.URL + "/v1", APIKey: "provider-secret", Priority: 100,
+			ModelAliases: map[string]string{
+				"gonka":                  "deepseek-v4-flash-0731",
+				"deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
+				"glm-5.3-flash":          "glm-5.3-flash",
+				"minimax-m2.7":           "minimax-m2.7",
+			},
+		}},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":                  {Providers: []string{"gonka-router"}},
+			"deepseek-v4-flash-0731": {Providers: []string{"gonka-router"}},
+			"glm-5.3-flash":          {Providers: []string{"gonka-router"}},
+			"minimax-m2.7":           {Providers: []string{"gonka-router"}},
+		},
+		ModelRouteOrder: []string{"gonka", "deepseek-v4-flash-0731", "glm-5.3-flash", "minimax-m2.7"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	requests := []struct {
+		model string
+		alias string
+	}{
+		{model: "gonka", alias: "deepseek-v4-flash-0731"},
+		{model: "deepseek-v4-flash-0731", alias: "deepseek-v4-flash-0731"},
+		{model: "glm-5.3-flash", alias: "glm-5.3-flash"},
+		{model: "minimax-m2.7", alias: "minimax-m2.7"},
+		{model: "", alias: "deepseek-v4-flash-0731"},
+	}
+	for _, request := range requests {
+		body := `{"messages":[]}`
+		if request.model != "" {
+			body = fmt.Sprintf(`{"model":%q,"messages":[]}`, request.model)
+		}
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("request model %q: %v", request.model, err)
+		}
+		if response.StatusCode != http.StatusOK {
+			responseBody, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			t.Fatalf("request model %q status = %d, body = %s", request.model, response.StatusCode, responseBody)
+		}
+		_ = response.Body.Close()
+	}
+	if !reflect.DeepEqual(upstreamModels, []string{
+		"deepseek-v4-flash-0731",
+		"deepseek-v4-flash-0731",
+		"glm-5.3-flash",
+		"minimax-m2.7",
+		"deepseek-v4-flash-0731",
+	}) {
+		t.Fatalf("upstream models = %#v", upstreamModels)
+	}
+
+	modelsResponse, err := http.Get(server.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer modelsResponse.Body.Close()
+	var models struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(modelsResponse.Body).Decode(&models); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	ids := make([]string, 0, len(models.Data))
+	for _, model := range models.Data {
+		ids = append(ids, model.ID)
+	}
+	if !reflect.DeepEqual(ids, []string{"gonka", "deepseek-v4-flash-0731", "glm-5.3-flash", "minimax-m2.7"}) {
+		t.Fatalf("model IDs = %#v", ids)
+	}
+
+	unknown, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"unknown","messages":[]}`))
+	if err != nil {
+		t.Fatalf("unknown model request: %v", err)
+	}
+	defer unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown model status = %d, want 404", unknown.StatusCode)
+	}
+}
+
+func TestModelsPublishesFloorAcrossRouteProviders(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "wide", BaseURL: "https://wide.example/v1", APIKey: "wide-secret", Priority: 100,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds", "minimax-m2.7": "mm"},
+				ModelLimits:  map[string]config.ModelLimit{"deepseek-v4-flash-0731": {Context: 400000, Output: 16384}},
+			},
+			{
+				Name: "narrow", BaseURL: "https://narrow.example/v1", APIKey: "narrow-secret", Priority: 50,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds-narrow", "minimax-m2.7": "mm-narrow"},
+				ModelLimits: map[string]config.ModelLimit{
+					"deepseek-v4-flash-0731": {Context: 200000, Output: 8192},
+					"minimax-m2.7":           {Context: 180000},
+				},
+			},
+			{
+				Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+				ModelAliases: map[string]string{"deepseek-v4-flash-0731": "ds-silent", "minimax-m2.7": "mm-silent"},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"deepseek-v4-flash-0731": {},
+			"minimax-m2.7":           {},
+		},
+		ModelRouteOrder: []string{"deepseek-v4-flash-0731", "minimax-m2.7"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		// the floor comes from narrow, the smallest declared value in the route
+		"deepseek-v4-flash-0731": {Context: 200000, Output: 8192, ContextSet: true, OutputSet: true},
+		// narrow declares context only, so output stays unknown rather than 0
+		"minimax-m2.7": {Context: 180000, ContextSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+func TestModelsOmitsLimitsWhenNoProviderDeclaresThem(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+			ModelAliases: map[string]string{"gonka": "ds"},
+		}},
+		ModelRoutes:     map[string]config.ModelRoute{"gonka": {}},
+		ModelRouteOrder: []string{"gonka"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	if got, ok := limits["gonka"]; ok {
+		t.Fatalf("published limits = %+v, want no entry for an undeclared model", got)
+	}
+}
+
+func TestModelsLimitsIgnoreProvidersOutsideTheRoute(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "member", BaseURL: "https://member.example/v1", APIKey: "member-secret", Priority: 100,
+				ModelAliases: map[string]string{"glm-5.3-flash": "glm-member"},
+				ModelLimits:  map[string]config.ModelLimit{"glm-5.3-flash": {Context: 400000, Output: 16384}},
+			},
+			{
+				// serves the same Virtual Model but is not in this route, so its
+				// smaller limit must not lower the published floor
+				Name: "outsider", BaseURL: "https://outsider.example/v1", APIKey: "outsider-secret", Priority: 50,
+				ModelAliases: map[string]string{"glm-5.3-flash": "glm-outsider"},
+				ModelLimits:  map[string]config.ModelLimit{"glm-5.3-flash": {Context: 1000, Output: 1}},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"glm-5.3-flash": {Providers: []string{"member"}},
+		},
+		ModelRouteOrder: []string{"glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		"glm-5.3-flash": {Context: 400000, Output: 16384, ContextSet: true, OutputSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+func TestModelsLimitsUseLegacyProviderModel(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{{
+			Name: "legacy", BaseURL: "https://legacy.example/v1", APIKey: "legacy-secret", Priority: 10,
+			ModelAlias:  "upstream-model",
+			ModelLimits: map[string]config.ModelLimit{"gonka": {Context: 120000, Output: 4096}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	limits := fetchModelLimits(t, server.URL)
+	want := map[string]publishedLimit{
+		"gonka": {Context: 120000, Output: 4096, ContextSet: true, OutputSet: true},
+	}
+	if !reflect.DeepEqual(limits, want) {
+		t.Fatalf("published limits = %+v, want %+v", limits, want)
+	}
+}
+
+type publishedLimit struct {
+	Context    int
+	Output     int
+	ContextSet bool
+	OutputSet  bool
+}
+
+// fetchModelLimits reads /v1/models and reports the limit fields per model,
+// separating an absent field from a zero one.
+func fetchModelLimits(t *testing.T, baseURL string) map[string]publishedLimit {
+	t.Helper()
+	response, err := http.Get(baseURL + "/v1/models")
+	if err != nil {
+		t.Fatalf("models request: %v", err)
+	}
+	defer response.Body.Close()
+	var body struct {
+		Data []struct {
+			ID             string `json:"id"`
+			ContextLength  *int   `json:"context_length"`
+			ContextWindow  *int   `json:"context_window"`
+			MaxOutputToken *int   `json:"max_output_tokens"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	limits := make(map[string]publishedLimit, len(body.Data))
+	for _, entry := range body.Data {
+		limit := publishedLimit{}
+		if entry.ContextLength != nil {
+			limit.Context, limit.ContextSet = *entry.ContextLength, true
+		}
+		if entry.ContextWindow != nil {
+			if limit.ContextSet && limit.Context != *entry.ContextWindow {
+				t.Errorf("%s context_length %d disagrees with context_window %d", entry.ID, limit.Context, *entry.ContextWindow)
+			}
+			limit.Context, limit.ContextSet = *entry.ContextWindow, true
+		}
+		if entry.MaxOutputToken != nil {
+			limit.Output, limit.OutputSet = *entry.MaxOutputToken, true
+		}
+		if limit.ContextSet || limit.OutputSet {
+			limits[entry.ID] = limit
+		}
+	}
+	return limits
+}
+
+func TestDiagnosticsReportsUndeclaredModelLimitProviders(t *testing.T) {
+	reasoningMax := config.ReasoningEffortMax
+	handler, err := proxy.New(config.Config{
+		ListenAddress:         "127.0.0.1:8080",
+		Cooldown:              time.Second,
+		RecoveryWait:          time.Second,
+		ResponseHeaderTimeout: time.Second,
+		HealthHistoryPath:     filepath.Join(t.TempDir(), "health-history.json"),
+		ReasoningEffort:       &reasoningMax,
+		Providers: []config.Provider{
+			{
+				Name: "declared", BaseURL: "https://declared.example/v1", APIKey: "declared-secret", Priority: 100,
+				ModelAliases: map[string]string{"gonka": "ds", "glm-5.3-flash": "glm"},
+				ModelLimits: map[string]config.ModelLimit{
+					"gonka":         {Context: 200000, Output: 8192},
+					"glm-5.3-flash": {Context: 400000, Output: 16384},
+				},
+			},
+			{
+				// declares a context window but stays silent about generation,
+				// which must be reported per dimension
+				Name: "context-only", BaseURL: "https://context.example/v1", APIKey: "context-secret", Priority: 50,
+				ModelAliases: map[string]string{"gonka": "ds-context"},
+				ModelLimits:  map[string]config.ModelLimit{"gonka": {Context: 380000}},
+			},
+			{
+				Name: "silent", BaseURL: "https://silent.example/v1", APIKey: "silent-secret", Priority: 10,
+				ModelAliases: map[string]string{"gonka": "ds-silent", "glm-5.3-flash": "glm-silent"},
+			},
+		},
+		ModelRoutes: map[string]config.ModelRoute{
+			"gonka":         {},
+			"glm-5.3-flash": {Providers: []string{"declared"}},
+		},
+		ModelRouteOrder: []string{"gonka", "glm-5.3-flash"},
+	})
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics request: %v", err)
+	}
+	defer response.Body.Close()
+	var body struct {
+		ModelLimits []struct {
+			Model           string   `json:"model"`
+			ContextLength   int      `json:"context_length"`
+			MaxOutputTokens int      `json:"max_output_tokens"`
+			ContextUnknown  []string `json:"context_unknown_providers"`
+			OutputUnknown   []string `json:"output_unknown_providers"`
+			Remediation     string   `json:"remediation"`
+		} `json:"model_limits"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode diagnostics: %v", err)
+	}
+	if len(body.ModelLimits) != 2 {
+		t.Fatalf("model_limits = %d entries, want 2: %+v", len(body.ModelLimits), body.ModelLimits)
+	}
+	if body.ModelLimits[0].Model != "gonka" {
+		t.Fatalf("first model = %q, want gonka in route order", body.ModelLimits[0].Model)
+	}
+	if body.ModelLimits[0].ContextLength != 200000 || body.ModelLimits[0].MaxOutputTokens != 8192 {
+		t.Errorf("gonka limits = %d/%d, want 200000/8192", body.ModelLimits[0].ContextLength, body.ModelLimits[0].MaxOutputTokens)
+	}
+	if !reflect.DeepEqual(body.ModelLimits[0].ContextUnknown, []string{"silent"}) {
+		t.Errorf("gonka context_unknown = %v, want [silent]", body.ModelLimits[0].ContextUnknown)
+	}
+	if !reflect.DeepEqual(body.ModelLimits[0].OutputUnknown, []string{"context-only", "silent"}) {
+		t.Errorf("gonka output_unknown = %v, want [context-only silent]", body.ModelLimits[0].OutputUnknown)
+	}
+	if body.ModelLimits[0].Remediation == "" {
+		t.Error("gonka remediation is empty, want a hint about the silent providers")
+	}
+	if len(body.ModelLimits[1].ContextUnknown) != 0 || len(body.ModelLimits[1].OutputUnknown) != 0 {
+		t.Errorf("glm-5.3-flash unknown = %v/%v, want none because its route lists only the declared provider",
+			body.ModelLimits[1].ContextUnknown, body.ModelLimits[1].OutputUnknown)
+	}
+	if body.ModelLimits[1].Remediation != "" {
+		t.Errorf("glm-5.3-flash remediation = %q, want empty", body.ModelLimits[1].Remediation)
+	}
+}
+
 func TestModelsListsLegacyGonkaRouteWithoutProviderDetails(t *testing.T) {
 	reasoningMax := config.ReasoningEffortMax
 	handler, err := proxy.New(config.Config{
