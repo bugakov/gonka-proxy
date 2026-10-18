@@ -53,7 +53,7 @@ List your providers in any order; Gonka always tries the **highest `priority` nu
 
 Set `failover_on_404: true` to treat any provider HTTP 404 as a failover failure: the proxy tries the next available provider and places the one that returned 404 in cooldown. The default is `false`, which passes 404 responses back to the client unchanged.
 
-`log_level` is a minimum severity. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation—while `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded provider error message or stream tail; prompts, request bodies, authorization headers, and API keys are never logged, and response content is suppressed at `WARN` and `ERROR`.
+`log_level` is a minimum severity. `INFO` includes detailed lifecycle diagnostics—Provider selection and successes, Cooldown and Recovery Wait transitions, and cancellation—while `WARN` (the default) suppresses those INFO-only events but retains Failover Failure and stream-abort events. Client cancellation before `[DONE]` is logged only at `INFO`; cancellation after `[DONE]` has been forwarded is not logged. Neither affects Provider availability. Upstream read errors and unexpected EOF without `[DONE]` remain stream-abort events. `ERROR` is the strictest threshold and emits only ERROR-level events. At `INFO`, an error may include a bounded provider error message or stream tail; prompts, request bodies, authorization headers, and API keys are never logged, and response content is suppressed at `WARN` and `ERROR`.
 
 ## Reasoning effort
 

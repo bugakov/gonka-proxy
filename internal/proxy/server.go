@@ -483,10 +483,17 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 		readCount, readErr := body.Read(buffer)
 		if readCount > 0 {
 			chunk := buffer[:readCount]
-			acc.observe(chunk)
 			sentBytes += int64(readCount)
 			chunks++
-			if _, writeErr := w.Write(chunk); writeErr != nil {
+			_, writeErr := w.Write(chunk)
+			if writeErr != nil && r.Context().Err() != nil {
+				if !acc.sawDone() {
+					s.logCancellation("stream")
+				}
+				return
+			}
+			acc.observe(chunk)
+			if writeErr != nil {
 				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 					fmt.Sprintf("client-write error: %v", writeErr))
 				return
@@ -499,6 +506,12 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 		if readErr == nil {
 			continue
 		}
+		if r.Context().Err() != nil {
+			if !acc.sawDone() {
+				s.logCancellation("stream")
+			}
+			return
+		}
 		if errors.Is(readErr, io.EOF) {
 			if acc.sawDone() {
 				return
@@ -506,11 +519,6 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
 			s.markCooldown(selected)
-			return
-		}
-		if r.Context().Err() != nil {
-			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
-				fmt.Sprintf("upstream read error: %v (request context canceled during stream)", readErr))
 			return
 		}
 		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
