@@ -19,6 +19,7 @@ const (
 	DefaultRecoveryWait          = 30 * time.Second
 	DefaultResponseHeaderTimeout = 30 * time.Second
 	DefaultLogLevel              = "WARN"
+	DefaultHealthHistoryPath     = "health-history.json"
 )
 
 // LogLevel is a configurable minimum severity threshold. Lines at or above
@@ -106,6 +107,7 @@ type Config struct {
 	RecoveryWait          time.Duration
 	ResponseHeaderTimeout time.Duration
 	LogLevel              LogLevel
+	HealthHistoryPath     string
 	ReasoningEffort       *ReasoningEffort
 	FailoverOn404         bool
 	Providers             []Provider
@@ -133,6 +135,11 @@ type Provider struct {
 	ModelAliases map[string]string
 	Priority     int
 
+	// HealthCheckURL and BalanceURL drive the /diagnostics endpoint. When
+	// HealthCheckURL is empty, diagnostics probes BaseURL + "/models".
+	HealthCheckURL string
+	BalanceURL     string
+
 	ReasoningEffort      *ReasoningEffort
 	StripReasoningEffort bool
 }
@@ -143,6 +150,7 @@ type rawConfig struct {
 	RecoveryWait          string                   `yaml:"recovery_wait"`
 	ResponseHeaderTimeout string                   `yaml:"response_header_timeout"`
 	LogLevel              string                   `yaml:"log_level"`
+	HealthHistoryPath     string                   `yaml:"health_history_path"`
 	ReasoningEffort       *string                  `yaml:"reasoning_effort"` // present for KnownFields; value sourced from rawMap to distinguish null vs absent
 	FailoverOn404         bool                     `yaml:"failover_on_404"`
 	Providers             []rawProvider            `yaml:"providers"`
@@ -154,12 +162,14 @@ type rawServer struct {
 }
 
 type rawProvider struct {
-	Name         string            `yaml:"name"`
-	BaseURL      string            `yaml:"base_url"`
-	APIKey       string            `yaml:"api_key"`
-	ModelAlias   string            `yaml:"model_alias"`
-	ModelAliases map[string]string `yaml:"model_aliases"`
-	Priority     *int              `yaml:"priority"`
+	Name           string            `yaml:"name"`
+	BaseURL        string            `yaml:"base_url"`
+	APIKey         string            `yaml:"api_key"`
+	ModelAlias     string            `yaml:"model_alias"`
+	ModelAliases   map[string]string `yaml:"model_aliases"`
+	Priority       *int              `yaml:"priority"`
+	HealthCheckURL string            `yaml:"health_check_url"`
+	BalanceURL     string            `yaml:"balance_url"`
 	// ReasoningEffort keeps the raw node to distinguish absent (inherit
 	// global, zero Node) from explicit null (strip for this provider).
 	ReasoningEffort yaml.Node `yaml:"reasoning_effort"`
@@ -223,6 +233,7 @@ func Load(path string) (Config, error) {
 		RecoveryWait:          0,
 		ResponseHeaderTimeout: 0,
 		LogLevel:              LogLevel(DefaultLogLevel),
+		HealthHistoryPath:     strings.TrimSpace(raw.HealthHistoryPath),
 		ReasoningEffort:       parsedReasoningEffort,
 		FailoverOn404:         raw.FailoverOn404,
 		Providers:             make([]Provider, 0, len(raw.Providers)),
@@ -231,6 +242,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = DefaultListenAddress
+	}
+	if cfg.HealthHistoryPath == "" {
+		cfg.HealthHistoryPath = DefaultHealthHistoryPath
 	}
 
 	if cfg.Cooldown, err = parseDuration("cooldown", raw.Cooldown, DefaultCooldown); err != nil {
@@ -356,12 +370,20 @@ func (c Config) Validate() error {
 		if _, err := parseProviderBaseURL(index, provider.BaseURL); err != nil {
 			return err
 		}
+		if _, err := parseOptionalProviderURL(index, "health_check_url", provider.HealthCheckURL); err != nil {
+			return err
+		}
+		if _, err := parseOptionalProviderURL(index, "balance_url", provider.BalanceURL); err != nil {
+			return err
+		}
 		definitionKey := providerIdentity{
 			baseURL:      provider.BaseURL,
 			apiKey:       provider.APIKey,
 			modelAlias:   provider.ModelAlias,
 			modelAliases: modelAliasesIdentity(provider.ModelAliases),
 			priority:     provider.Priority,
+			healthURL:    provider.HealthCheckURL,
+			balanceURL:   provider.BalanceURL,
 		}
 		if _, exists := seen[definitionKey]; exists {
 			return fmt.Errorf("providers[%d] duplicates another Provider definition", index)
@@ -377,6 +399,8 @@ type providerIdentity struct {
 	modelAlias   string
 	modelAliases string
 	priority     int
+	healthURL    string
+	balanceURL   string
 }
 
 func (c Config) validateModelRoutes() error {
@@ -574,6 +598,14 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	parsed.RawPath = ""
 	normalizedURL := strings.TrimRight(parsed.String(), "/")
+	healthCheckURL, err := parseOptionalProviderURL(index, "health_check_url", raw.HealthCheckURL)
+	if err != nil {
+		return Provider{}, err
+	}
+	balanceURL, err := parseOptionalProviderURL(index, "balance_url", raw.BalanceURL)
+	if err != nil {
+		return Provider{}, err
+	}
 
 	var effortOverride *ReasoningEffort
 	var stripEffort bool
@@ -593,12 +625,14 @@ func normalizeProvider(index int, raw rawProvider) (Provider, error) {
 	}
 
 	provider := Provider{
-		Name:         strings.TrimSpace(raw.Name),
-		BaseURL:      normalizedURL,
-		APIKey:       strings.TrimSpace(raw.APIKey),
-		ModelAlias:   strings.TrimSpace(raw.ModelAlias),
-		ModelAliases: normalizeModelAliases(raw.ModelAliases),
-		Priority:     *raw.Priority,
+		Name:           strings.TrimSpace(raw.Name),
+		BaseURL:        normalizedURL,
+		APIKey:         strings.TrimSpace(raw.APIKey),
+		ModelAlias:     strings.TrimSpace(raw.ModelAlias),
+		ModelAliases:   normalizeModelAliases(raw.ModelAliases),
+		Priority:       *raw.Priority,
+		HealthCheckURL: healthCheckURL,
+		BalanceURL:     balanceURL,
 
 		ReasoningEffort:      effortOverride,
 		StripReasoningEffort: stripEffort,
@@ -615,6 +649,26 @@ func normalizeModelAliases(raw map[string]string) map[string]string {
 		normalized[strings.TrimSpace(model)] = strings.TrimSpace(alias)
 	}
 	return normalized
+}
+
+func parseOptionalProviderURL(index int, field, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("providers[%d].%s must be an absolute HTTP(S) URL", index, field)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("providers[%d].%s must use http or https", index, field)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("providers[%d].%s must not contain credentials, query parameters, or fragments", index, field)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = ""
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func parseProviderBaseURL(index int, value string) (*url.URL, error) {

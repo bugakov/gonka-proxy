@@ -109,6 +109,60 @@ model_routes:
 
 Fallback chains are allowed (`fallback` → `fallback`), and cycles or unknown route references are rejected at startup with an actionable error.
 
+## Metrics
+
+The proxy exposes Prometheus-compatible metrics at `GET /metrics` on the same address as the chat endpoint. Keep the listener on loopback when metrics must remain local:
+
+```sh
+curl http://127.0.0.1:58081/metrics
+```
+
+Metrics are grouped by the configured provider name and include successful and failed provider attempts, upstream status/category, failovers, cooldown activations and skips, stream aborts, and latency histograms. The endpoint contains no request bodies, response bodies, authorization headers, or API keys. Useful signals include:
+
+- `gonka_proxy_provider_requests_total` — each request result per provider, labelled by API endpoint (`endpoint="chat/completions"`) and `result`;
+- `gonka_proxy_provider_upstream_responses_total` — upstream status and safe failure category;
+- `gonka_proxy_provider_failovers_total` and `gonka_proxy_provider_cooldowns_total` — provider failures that caused routing changes;
+- `gonka_proxy_provider_stream_aborts_total` — streams cut before the `[DONE]` marker or by a client/upstream read error;
+- `gonka_proxy_provider_request_duration_seconds` — completed request latency per provider.
+
+For a human-readable current summary, use `GET /health`:
+
+```sh
+curl http://127.0.0.1:58081/health
+```
+
+The summary includes each provider's healthy/degraded/unavailable status, last success and error, cooldown transitions, request/error counts, and latency averages. The state is stored in `health_history_path`; writes use an atomic replacement and are best-effort, so an unavailable or read-only path does not stop routing. Events older than 30 days and entries beyond the latest 1,000 are removed.
+
+For active provider diagnostics, use `GET /diagnostics`:
+
+```sh
+curl http://127.0.0.1:58081/diagnostics
+```
+
+Diagnostics perform a safe `GET` request (by default to `<base_url>/models`) and never send chat messages, prompts, tools, or request bodies. They classify invalid keys, unavailable endpoints, rate/concurrency exhaustion, insufficient balance, and transient failures, with a remediation hint. A provider-specific `balance_url` can be configured when that API exists; otherwise the balance result is reported as `unavailable/unsupported`.
+
+Each report also carries an `observed` block, built only from traffic the proxy already recorded, so it adds no request of its own:
+
+```json
+{
+  "provider": "gonka24",
+  "status": "healthy",
+  "observed": {
+    "status": "degraded",
+    "window_hours": 24,
+    "successes": 14,
+    "errors": 18,
+    "error_categories": {"upstream-read": 15, "response-header-timeout": 3},
+    "last_success": "2026-09-25T22:58:10Z",
+    "last_error": "2026-09-25T23:01:44Z",
+    "last_error_category": "upstream-read",
+    "cooldown_until": "2026-09-25T23:02:14Z"
+  }
+}
+```
+
+`observed.status` grades real traffic over the trailing window: `no-data` when nothing was routed to the provider, `healthy` when everything succeeded, `degraded` when both succeeded and failed, `unavailable` when everything failed or the provider is cooling down. Categories are capped to the eight most frequent reasons per provider.
+
 ## Reasoning effort
 
 `reasoning_effort` hints how much reasoning the upstream model should do. The proxy writes your configured value into every upstream request — whatever the client sends is overwritten. Allowed values: `none`, `low`, `medium`, `high`, `xhigh`, `max`, plus `null` (`~`) to strip the field entirely. The top-level key is **required**.

@@ -49,6 +49,7 @@ type Server struct {
 	modelOrder       []string
 	legacyModelMode  bool
 	fallbackMode     bool
+	metrics          *metricsCollector
 	client           *http.Client
 	cooldownDuration time.Duration
 	recoveryWait     time.Duration
@@ -155,7 +156,7 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		}
 	}
 
-	return &Server{
+	server := &Server{
 		providers:        providers,
 		routes:           routes,
 		fallbacks:        fallbacks,
@@ -170,7 +171,13 @@ func NewWithLogger(cfg config.Config, logger Logger) (*Server, error) {
 		logger:        logger,
 		logLevel:      logLevel,
 		failoverOn404: cfg.FailoverOn404,
-	}, nil
+	}
+	providerNames := make([]string, 0, len(providers))
+	for _, selected := range providers {
+		providerNames = append(providerNames, server.redactProviderSecrets(selected.Name))
+	}
+	server.metrics = newMetricsCollector(cfg.HealthHistoryPath, providerNames, logger)
+	return server, nil
 }
 
 // normalizeReasoningEffort normalizes an effort pointer so programmatic
@@ -209,8 +216,43 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if r.URL.Path == "/metrics" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if err := s.metrics.serveHTTP(w); err != nil {
+			s.logAt(config.LogLevelError, "metrics response error - %v", err)
+		}
+		return
+	}
+	if r.URL.Path == "/health" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if err := s.metrics.serveHealth(w); err != nil {
+			s.logAt(config.LogLevelError, "health response error - %v", err)
+		}
+		return
+	}
+	if r.URL.Path == "/diagnostics" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := s.serveDiagnostics(w, r.Context()); err != nil {
+			s.logAt(config.LogLevelError, "diagnostics response error - %v", err)
+		}
+		return
+	}
 	if r.URL.Path != chatCompletionsPath {
-		http.NotFound(w, r)
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -305,6 +347,7 @@ type routeFailure struct {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[string]json.RawMessage) {
+	requestStarted := time.Now()
 	model, err := requestModel(payload)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -351,8 +394,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				}
 
 				if !s.providerAvailable(selected, time.Now()) {
+					s.metrics.recordCooldownSkip(s.metricProviderName(selected))
 					continue
 				}
+				attemptStarted := time.Now()
+				s.metrics.recordRequestStart(s.metricProviderName(selected))
 				s.logAt(config.LogLevelInfo, "provider selected - %s - priority=%d", s.redactProviderSecrets(selected.Name), selected.Priority)
 
 				modelAlias, ok := selected.ModelAliasFor(routeName)
@@ -389,6 +435,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					if isResponseHeaderTimeout(err) {
 						category = "response-header-timeout"
 					}
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), 0, category)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 					lastFailure = routeFailure{status: http.StatusBadGateway, category: category}
 					s.handleFailoverFailure(selected, category, 0)
 					continue
@@ -417,6 +466,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 						case http.StatusNotFound:
 							category = "not-found"
 						}
+						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, category)
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: category}
 						s.handleFailoverFailure(selected, category, upstreamResponse.StatusCode)
 						continue
@@ -433,6 +485,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					s.logProviderResponse(selected, upstreamResponse.StatusCode, errorMessage)
 
 					if isReasoningEffortUnsupportedError(upstreamResponse.StatusCode, errorMessage, responseBody) {
+						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "reasoning-effort")
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: "reasoning-effort"}
 						s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
 						continue
@@ -441,17 +496,25 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					copyHeaders(w.Header(), upstreamResponse.Header)
 					w.WriteHeader(upstreamResponse.StatusCode)
 					_, _ = w.Write(responseBody)
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "client-error")
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 					return
 				}
 
 				s.logProviderResponse(selected, upstreamResponse.StatusCode, "")
+				s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "success")
 
 				streaming := isStreamingResponse(upstreamResponse, payload)
 				defer upstreamResponse.Body.Close()
 				if streaming {
 					copyHeaders(w.Header(), upstreamResponse.Header)
 					w.WriteHeader(upstreamResponse.StatusCode)
-					s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
+					completed := s.forwardStreamingResponse(w, r, selected, upstreamResponse.StatusCode, upstreamResponse.Body)
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					if completed {
+						s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
+					}
 					return
 				}
 
@@ -462,12 +525,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 						return
 					}
 					lastFailure = routeFailure{status: http.StatusBadGateway, category: "upstream-read"}
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), http.StatusBadGateway, "upstream-read")
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 					s.handleFailoverFailure(selected, "upstream-read", http.StatusBadGateway)
 					continue
 				}
 
 				if isEmptyCompletion(responseBody) {
 					lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: emptyCompletionCategory}
+					s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+					s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, emptyCompletionCategory)
+					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 					s.handleFailoverFailure(selected, emptyCompletionCategory, upstreamResponse.StatusCode)
 					continue
 				}
@@ -475,6 +544,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 				copyHeaders(w.Header(), upstreamResponse.Header)
 				w.WriteHeader(upstreamResponse.StatusCode)
 				_, _ = w.Write(responseBody)
+				s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+				s.metrics.recordRequest(s.metricProviderName(selected), "success", time.Since(requestStarted).Seconds())
 				return
 			}
 
@@ -560,6 +631,7 @@ func (s *Server) clearCooldowns(versions map[*provider]uint64) int {
 	}
 	s.cooldownMu.Unlock()
 	for _, selected := range cleared {
+		s.metrics.recordCooldownCleared(s.metricProviderName(selected))
 		s.logAt(config.LogLevelInfo, "%s - cooldown cleared", s.redactProviderSecrets(selected.Name))
 	}
 	return len(cleared)
@@ -630,7 +702,7 @@ func isSSEDoneLine(line []byte) bool {
 		bytes.Equal(line, []byte("data: "+sseDoneMarker))
 }
 
-func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) {
+func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request, selected *provider, statusCode int, body io.Reader) bool {
 	flusher, canFlush := w.(http.Flusher)
 	if canFlush {
 		flusher.Flush()
@@ -652,13 +724,13 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 				if !acc.sawDone() {
 					s.logCancellation("stream")
 				}
-				return
+				return false
 			}
 			acc.observe(chunk)
 			if writeErr != nil {
 				s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 					fmt.Sprintf("client-write error: %v", writeErr))
-				return
+				return false
 			}
 			if canFlush {
 				flusher.Flush()
@@ -672,25 +744,28 @@ func (s *Server) forwardStreamingResponse(w http.ResponseWriter, r *http.Request
 			if !acc.sawDone() {
 				s.logCancellation("stream")
 			}
-			return
+			return false
 		}
 		if errors.Is(readErr, io.EOF) {
 			if acc.sawDone() {
-				return
+				return true
 			}
 			s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 				"stream ended at EOF without [DONE] marker (broker SILENTLY cut the response)")
 			s.markCooldown(selected)
-			return
+			return false
 		}
+
 		s.recordStreamAbort(selected, statusCode, sentBytes, chunks, acc,
 			fmt.Sprintf("upstream read error: %v", readErr))
 		s.handleFailoverFailure(selected, "stream", statusCode)
-		return
+		return false
 	}
 }
 
 func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes, chunks int64, acc *dataChunk, reason string) {
+	s.metrics.recordStreamAbort(s.metricProviderName(selected), streamAbortCategory(reason))
+	s.metrics.recordRequest(s.metricProviderName(selected), "error", 0)
 	providerName := s.redactProviderSecrets(selected.Name)
 	redactedReason := s.redactProviderSecrets(reason)
 	if s.payloadLoggingEnabled() {
@@ -700,6 +775,17 @@ func (s *Server) recordStreamAbort(selected *provider, statusCode int, sentBytes
 	}
 	s.logAt(config.LogLevelWarn, "STREAM-ABORT provider=%s status=%d sent_bytes=%d chunks=%d reason=%s",
 		providerName, statusCode, sentBytes, chunks, redactedReason)
+}
+
+func streamAbortCategory(reason string) string {
+	switch {
+	case strings.Contains(reason, "client-write"):
+		return "client-write"
+	case strings.Contains(reason, "without [DONE]"):
+		return "missing-done"
+	default:
+		return "upstream-read"
+	}
 }
 
 func tail(acc *dataChunk) string {
@@ -760,16 +846,22 @@ func (s *Server) markCooldown(selected *provider) {
 		selected.cooldownUntil = cooldownUntil
 	}
 	s.cooldownMu.Unlock()
+	s.metrics.recordCooldown(s.metricProviderName(selected), cooldownUntil)
 	s.logAt(config.LogLevelInfo, "%s - cooldown - %s", s.redactProviderSecrets(selected.Name), s.cooldownDuration)
 }
 
 func (s *Server) handleFailoverFailure(selected *provider, category string, statusCode int) {
+	s.metrics.recordFailover(s.metricProviderName(selected), category)
 	if statusCode > 0 {
 		s.logAt(config.LogLevelWarn, "%s - failover - %s - %d", s.redactProviderSecrets(selected.Name), category, statusCode)
 	} else {
 		s.logAt(config.LogLevelWarn, "%s - failover - %s", s.redactProviderSecrets(selected.Name), category)
 	}
 	s.markCooldown(selected)
+}
+
+func (s *Server) metricProviderName(selected *provider) string {
+	return s.redactProviderSecrets(selected.Name)
 }
 
 func (s *Server) logCancellation(phase string) {
