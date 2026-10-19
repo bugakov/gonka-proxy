@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -33,9 +34,20 @@ type balanceDiagnostic struct {
 }
 
 type diagnosticsResponse struct {
-	GeneratedAt time.Time          `json:"generated_at"`
-	Providers   []diagnosticReport `json:"providers"`
-	ModelLimits []routeLimitReport `json:"model_limits,omitempty"`
+	GeneratedAt    time.Time            `json:"generated_at"`
+	Providers      []diagnosticReport   `json:"providers"`
+	ModelLimits    []routeLimitReport   `json:"model_limits,omitempty"`
+	RouteFallbacks []fallbackDiagnostic `json:"route_fallbacks,omitempty"`
+}
+
+// fallbackDiagnostic summarises how often one model route handed over to
+// another, and when the last such transition happened.
+type fallbackDiagnostic struct {
+	FromRoute      string    `json:"from_route"`
+	ToRoute        string    `json:"to_route"`
+	Reason         string    `json:"reason"`
+	Count          uint64    `json:"count"`
+	LastTransition time.Time `json:"last_transition,omitempty"`
 }
 
 // routeLimitReport shows what /v1/models publishes for one route and, crucially,
@@ -59,10 +71,31 @@ func (s *Server) serveDiagnostics(w io.Writer, ctx context.Context) error {
 	for _, selected := range s.providers {
 		reports = append(reports, s.diagnoseProvider(ctx, selected, observed))
 	}
+	fallbackCounts, lastFallback := s.metrics.routeFallbackSnapshot()
+	fallbacks := make([]fallbackDiagnostic, 0, len(fallbackCounts))
+	for key, count := range fallbackCounts {
+		fallback := fallbackDiagnostic{
+			FromRoute: key.fromRoute,
+			ToRoute:   key.toRoute,
+			Reason:    key.reason,
+			Count:     count,
+		}
+		if lastFallback != nil && lastFallback.FromRoute == key.fromRoute && lastFallback.ToRoute == key.toRoute && lastFallback.Reason == key.reason {
+			fallback.LastTransition = lastFallback.At
+		}
+		fallbacks = append(fallbacks, fallback)
+	}
+	sort.Slice(fallbacks, func(i, j int) bool {
+		if fallbacks[i].FromRoute != fallbacks[j].FromRoute {
+			return fallbacks[i].FromRoute < fallbacks[j].FromRoute
+		}
+		return fallbacks[i].ToRoute < fallbacks[j].ToRoute
+	})
 	return json.NewEncoder(w).Encode(diagnosticsResponse{
-		GeneratedAt: time.Now().UTC(),
-		Providers:   reports,
-		ModelLimits: s.routeLimitReports(),
+		GeneratedAt:    time.Now().UTC(),
+		Providers:      reports,
+		ModelLimits:    s.routeLimitReports(),
+		RouteFallbacks: fallbacks,
 	})
 }
 

@@ -668,6 +668,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					reason = "providers-cooling-down"
 				}
 				s.logAt(config.LogLevelInfo, "route fallback - %s -> %s - %s", routeName, fallback, reason)
+				s.metrics.recordRouteFallback(routeName, fallback, reason)
 				routeName = fallback
 				break
 			}

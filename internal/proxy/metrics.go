@@ -13,9 +13,19 @@ import (
 var metricLatencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 type metricsCollector struct {
-	mu        sync.Mutex
-	providers map[string]*providerMetrics
-	health    *healthStore
+	mu             sync.Mutex
+	providers      map[string]*providerMetrics
+	routeFallbacks map[routeFallbackKey]uint64
+	health         *healthStore
+}
+
+// routeFallbackKey identifies one route-to-route fallback transition and
+// the reason that triggered it, so fallbacks are counted per pair of
+// routes instead of only per provider.
+type routeFallbackKey struct {
+	fromRoute string
+	toRoute   string
+	reason    string
 }
 
 type providerMetrics struct {
@@ -53,9 +63,33 @@ type metricHistogram struct {
 
 func newMetricsCollector(historyPath string, providerNames []string, logger Logger) *metricsCollector {
 	return &metricsCollector{
-		providers: make(map[string]*providerMetrics),
-		health:    newHealthStore(historyPath, providerNames, logger),
+		providers:      make(map[string]*providerMetrics),
+		routeFallbacks: make(map[routeFallbackKey]uint64),
+		health:         newHealthStore(historyPath, providerNames, logger),
 	}
+}
+
+// recordRouteFallback counts a transition from one model route to its
+// fallback route and keeps the last transition for the health and
+// diagnostics views.
+func (m *metricsCollector) recordRouteFallback(fromRoute, toRoute, reason string) {
+	m.mu.Lock()
+	m.routeFallbacks[routeFallbackKey{fromRoute: fromRoute, toRoute: toRoute, reason: reason}]++
+	m.mu.Unlock()
+	m.health.recordRouteFallback(fromRoute, toRoute, reason, time.Now())
+}
+
+// routeFallbackSnapshot returns the fallback counters and the last
+// transition, so diagnostics can show both totals and recency.
+func (m *metricsCollector) routeFallbackSnapshot() (map[routeFallbackKey]uint64, *routeFallbackEvent) {
+	m.mu.Lock()
+	counts := make(map[routeFallbackKey]uint64, len(m.routeFallbacks))
+	for key, count := range m.routeFallbacks {
+		counts[key] = count
+	}
+	m.mu.Unlock()
+	last := m.health.lastRouteFallback()
+	return counts, last
 }
 
 func (m *metricsCollector) provider(name string) *providerMetrics {
@@ -163,6 +197,7 @@ func (m *metricsCollector) serveHTTP(w io.Writer) error {
 		{"gonka_proxy_provider_cooldown_skips_total", "counter"},
 		{"gonka_proxy_provider_upstream_attempt_duration_seconds", "histogram"},
 		{"gonka_proxy_provider_request_duration_seconds", "histogram"},
+		{"gonka_proxy_route_fallback_total", "counter"},
 	}
 	for _, metricType := range metricTypes {
 		if _, err := fmt.Fprintf(w, "# TYPE %s %s\n", metricType.name, metricType.typeName); err != nil {
@@ -220,6 +255,24 @@ func (m *metricsCollector) serveHTTP(w io.Writer) error {
 			return err
 		}
 		if err := writeHistogram(w, "gonka_proxy_provider_request_duration_seconds", labels, provider.requestLatency); err != nil {
+			return err
+		}
+	}
+	fallbacks := make([]routeFallbackKey, 0, len(m.routeFallbacks))
+	for key := range m.routeFallbacks {
+		fallbacks = append(fallbacks, key)
+	}
+	sort.Slice(fallbacks, func(i, j int) bool {
+		if fallbacks[i].fromRoute != fallbacks[j].fromRoute {
+			return fallbacks[i].fromRoute < fallbacks[j].fromRoute
+		}
+		if fallbacks[i].toRoute != fallbacks[j].toRoute {
+			return fallbacks[i].toRoute < fallbacks[j].toRoute
+		}
+		return fallbacks[i].reason < fallbacks[j].reason
+	})
+	for _, key := range fallbacks {
+		if _, err := fmt.Fprintf(w, "gonka_proxy_route_fallback_total{from_route=\"%s\",reason=\"%s\",to_route=\"%s\"} %d\n", escapeMetricLabel(key.fromRoute), escapeMetricLabel(key.reason), escapeMetricLabel(key.toRoute), m.routeFallbacks[key]); err != nil {
 			return err
 		}
 	}
