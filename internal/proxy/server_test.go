@@ -3460,7 +3460,7 @@ func TestMetricsExposeProviderSuccessAndLatency(t *testing.T) {
 	}
 	metrics := string(metricsBody)
 	for _, expected := range []string{
-		`gonka_proxy_provider_requests_total{provider="primary",result="success"} 1`,
+		`gonka_proxy_provider_requests_total{provider="primary",endpoint="chat/completions",result="success"} 1`,
 		`gonka_proxy_provider_upstream_responses_total{category="success",provider="primary",status="200"} 1`,
 		`gonka_proxy_provider_request_duration_seconds_count{provider="primary"} 1`,
 	} {
