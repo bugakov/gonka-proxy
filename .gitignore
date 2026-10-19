@@ -62,8 +62,10 @@ id_ed25519
 /gonka-proxy.exe
 # brokerctl binary built locally for deployment (go build -o gonka-proxy-brokerctl).
 /gonka-proxy-brokerctl
-# Backups of the binary made during deploys (cp gonka-proxy gonka-proxy.bak-<ts>).
+# Backups of the binary made during deploys (cp gonka-proxy gonka-proxy.bak-<ts>
+# and the installer's gonka-proxy.bak.<ts>).
 /gonka-proxy.bak-*
+/gonka-proxy.bak.*
 
 # Test binaries, coverage, fuzz corpora.
 *.test
