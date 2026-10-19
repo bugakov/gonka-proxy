@@ -588,6 +588,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 						s.handleFailoverFailure(selected, "reasoning-effort", upstreamResponse.StatusCode)
 						continue
 					}
+					if failoverClientStatus(upstreamResponse.StatusCode, responseBody) {
+						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: "auth-disabled"}
+						s.metrics.recordAttempt(s.metricProviderName(selected), time.Since(attemptStarted).Seconds())
+						s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, "auth-disabled")
+						s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
+						s.handleFailoverFailure(selected, "auth-disabled", upstreamResponse.StatusCode)
+						continue
+					}
 
 					if routeEndpoint == endpointResponses && isUnsupportedResponsesEndpoint(upstreamResponse.StatusCode, responseBody) {
 						lastFailure = routeFailure{status: upstreamResponse.StatusCode, category: "unsupported-endpoint"}
@@ -643,11 +651,6 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, payload map[strin
 					s.metrics.recordResponse(s.metricProviderName(selected), upstreamResponse.StatusCode, emptyCompletionCategory)
 					s.metrics.recordRequest(s.metricProviderName(selected), "error", 0, routeEndpoint)
 					s.handleFailoverFailure(selected, emptyCompletionCategory, upstreamResponse.StatusCode)
-					continue
-				}
-
-				if failoverClientStatus(upstreamResponse.StatusCode, responseBody) {
-					s.handleFailoverFailure(selected, "auth-disabled", upstreamResponse.StatusCode)
 					continue
 				}
 
