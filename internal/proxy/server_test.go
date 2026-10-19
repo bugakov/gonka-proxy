@@ -4027,6 +4027,7 @@ func newProxyServerWithTimingValuesAndRecovery(t *testing.T, providers []provide
 		fmt.Fprintf(&yaml, "response_header_timeout: %s\n", responseHeaderTimeout)
 	}
 	yaml.WriteString("reasoning_effort: max\n")
+	fmt.Fprintf(&yaml, "health_history_path: %q\n", filepath.Join(t.TempDir(), "health-history.json"))
 	yaml.WriteString("providers:\n")
 	for index, provider := range providers {
 		name := provider.name
